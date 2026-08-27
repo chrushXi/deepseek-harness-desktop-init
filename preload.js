@@ -218,22 +218,6 @@ const TITLEBAR_CSS = `
   border-color: #4d6bfe;
   box-shadow: 0 0 0 3px rgba(77,107,254,.16);
 }
-/* 峰谷时段设置 */
-.dsh-tb-price-peak-title {
-  margin-top: 10px;
-  color: var(--dsw-alias-label-tertiary, #8a8f98);
-  font-size: 12px;
-}
-.dsh-tb-price-peak {
-  margin-top: 6px;
-  display: flex; align-items: center; gap: 5px; flex-wrap: wrap;
-}
-.dsh-tb-price-peak + .dsh-tb-price-peak {
-  margin-top: 4px;
-}
-.dsh-tb-peak-input {
-  width: 46px; flex: none; text-align: center;
-}
 .dsh-tb-price-actions {
   margin-top: 10px;
   display: flex; align-items: center; justify-content: space-between; gap: 8px;
@@ -459,13 +443,29 @@ function injectTitlebar() {
     const text = Math.abs(n) < 0.01 ? n.toFixed(4) : n.toFixed(2);
     return `${sign}${text}`;
   };
-  /** 峰谷判断跟随计费设置里保存的时段（未加载/未保存时用默认时段）。 */
+  /** 峰谷判断跟随计费设置里保存的时段与日期（未加载/未保存时用默认：周一至周五）。 */
   const isPeakNow = () => {
-    const hourText = new Intl.DateTimeFormat("en-GB", {
-      timeZone: "Asia/Shanghai", hour: "2-digit", hour12: false,
-    }).formatToParts(new Date()).find((part) => part.type === "hour")?.value;
-    const hour = Number(hourText);
-    const peaks = Array.isArray(priceTable && priceTable.peakHours) && priceTable.peakHours.length > 0
+    const zhParts = (field) => {
+      try {
+        return new Intl.DateTimeFormat("en-GB", {
+          timeZone: "Asia/Shanghai",
+          hour: "2-digit", hour12: false,
+          ...(field === "weekday" ? { weekday: "short" } : {}),
+        }).formatToParts(new Date()).find((part) => part.type === field)?.value;
+      } catch {
+        return undefined;
+      }
+    };
+    const hour = Number(zhParts("hour"));
+    const dayMap = { Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6, Sun: 7 };
+    const day = dayMap[zhParts("weekday")];
+    const weekdays = Array.isArray(priceTable && priceTable.weekdays)
+      ? priceTable.weekdays
+      : DEFAULT_PRICE_TABLE.weekdays;
+    if (!Number.isFinite(hour)) return false;
+    // 日期未激活（或全部关闭）则全天按谷价，不执行峰谷计费
+    if (weekdays.length === 0 || !weekdays.includes(day)) return false;
+    const peaks = Array.isArray(priceTable && priceTable.peakHours)
       ? priceTable.peakHours
       : DEFAULT_PRICE_TABLE.peakHours;
     return peaks.some(([start, end]) => hour >= Number(start) && hour < Number(end));
@@ -692,6 +692,8 @@ let pendingInstallVersionLocal = null;
 let priceTable = null;
 const DEFAULT_PRICE_TABLE = {
   version: "2026-08-17",
+  // 执行峰谷计费的星期：1=周一 … 7=周日（DeepSeek 周六日取消峰谷，默认周一至周五）
+  weekdays: [1, 2, 3, 4, 5],
   peakHours: [[9, 12], [14, 18]],
   models: {
     "deepseek-v4-flash": {
@@ -726,7 +728,7 @@ function compareVersionsPreload(a, b) {
   return prea < preb ? -1 : 1;
 }
 
-/** 应用桌面设置到界面（余额插件开关 / 小票开关）。 */
+/** 应用桌面设置到界面（余额插件开关 / 小票开关 / llama 配置）。 */
 function applySettings(s) {
   if (!s || typeof s !== "object") return;
   appSettings = { ...appSettings, ...s };
@@ -736,6 +738,11 @@ function applySettings(s) {
   }
   const receiptBtn = document.getElementById("dsh-tb-receipt-btn");
   if (receiptBtn) receiptBtn.hidden = !appSettings.receiptEnabled;
+  // llama 配置变更（保存后主进程会广播）：同步面板数据并轻量刷新
+  if (s.llama && typeof s.llama === "object" && llamaData) {
+    llamaData.config = s.llama;
+    renderLlamaPanel();
+  }
   syncSettingsSwitches();
 }
 
@@ -765,6 +772,7 @@ function ensurePriceTable() {
     }
   }
   if (!Array.isArray(priceTable.peakHours)) priceTable.peakHours = clonePriceTable(DEFAULT_PRICE_TABLE.peakHours);
+  if (!Array.isArray(priceTable.weekdays)) priceTable.weekdays = clonePriceTable(DEFAULT_PRICE_TABLE.weekdays);
   if (typeof priceTable.version !== "string") priceTable.version = DEFAULT_PRICE_TABLE.version;
   return priceTable;
 }
@@ -782,14 +790,17 @@ async function loadPricingTable() {
   }
 }
 
-/** 在指定容器内绑定计费设置表单（模型 / 价格 / 峰谷时段 / 默认 / 保存）。 */
+/** 在指定容器内绑定计费设置表单（模型 / 价格 / 峰谷日期 / 峰谷时段 / 默认 / 保存）。 */
 function attachPricingForm(root) {
   const priceModel = root.querySelector("#dsh-tb-price-model");
   const priceStatus = root.querySelector("#dsh-tb-price-status");
   const priceReset = root.querySelector("#dsh-tb-price-reset");
   const priceSave = root.querySelector("#dsh-tb-price-save");
-  const priceInputs = Array.from(root.querySelectorAll(".dsh-tb-price-input:not(.dsh-tb-peak-input)"));
-  const peakInputs = Array.from(root.querySelectorAll(".dsh-tb-peak-input"));
+  const priceInputs = Array.from(root.querySelectorAll(".dsh-tb-price-input:not(.dsh-tb-time-input)"));
+  const weekdayWrap = root.querySelector("#dsh-tb-price-weekdays");
+  const segmentWrap = root.querySelector("#dsh-tb-price-segments");
+  const addSegmentBtn = root.querySelector("#dsh-tb-price-add");
+  const WEEKDAY_LABELS = ["一", "二", "三", "四", "五", "六", "日"];
   let priceStatusTimer = null;
 
   const activePriceModel = () => (priceModel && priceModel.value ? priceModel.value : "deepseek-v4-flash");
@@ -809,6 +820,79 @@ function attachPricingForm(root) {
       }, 3500);
     }
   };
+  /** 数字小时 → "HH:MM"（24 → "00:00"，表示次日零点）。 */
+  const hoursToTime = (value) => {
+    const h = Number(value);
+    if (!Number.isFinite(h)) return "09:00";
+    const total = Math.max(0, Math.min(24, h));
+    const hh = Math.floor(total);
+    const mm = Math.round((total - hh) * 60);
+    if (mm === 60) {
+      return hoursToTime(hh + 1);
+    }
+    if (hh === 24) return "00:00";
+    return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
+  };
+  /** "HH:MM" → 数字小时（"00:00" 且 start>0 时视为 24）。 */
+  const timeToHours = (text, isEnd) => {
+    const m = String(text || "").trim().match(/^(\d{1,2}):(\d{2})$/);
+    if (!m) return null;
+    let hh = Number(m[1]);
+    const mm = Number(m[2]);
+    if (mm % 5 !== 0) return null;
+    if (hh === 24) hh = 24;
+    if (hh === 0 && mm === 0 && isEnd) return 24;
+    if (hh > 23 && hh !== 24) return null;
+    if (hh === 24 && mm !== 0) return null;
+    return hh + mm / 60;
+  };
+  /** 渲染星期圆圈（一 ～ 日），蓝色=激活。 */
+  const renderWeekdays = () => {
+    if (!weekdayWrap) return;
+    ensurePriceTable();
+    const active = Array.isArray(priceTable.weekdays) ? priceTable.weekdays : DEFAULT_PRICE_TABLE.weekdays;
+    weekdayWrap.innerHTML = WEEKDAY_LABELS.map((label, index) => {
+      const day = index + 1;
+      const on = active.includes(day);
+      return `<button class="dsh-tb-price-day${on ? " dsh-tb-price-day-on" : ""}" data-day="${day}" type="button" title="${on ? "已激活（执行峰谷）" : "未激活（全天谷价）"}">${label}</button>`;
+    }).join("");
+    weekdayWrap.querySelectorAll(".dsh-tb-price-day").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const day = Number(btn.dataset.day);
+        const next = priceTable.weekdays.includes(day)
+          ? priceTable.weekdays.filter((d) => d !== day)
+          : [...priceTable.weekdays, day].sort((a, b) => a - b);
+        priceTable.weekdays = next;
+        renderWeekdays();
+      });
+    });
+  };
+  /** 渲染动态时段行（每条：开始时间 – 结束时间 + 删除）。 */
+  const renderSegments = () => {
+    if (!segmentWrap) return;
+    ensurePriceTable();
+    const peaks = Array.isArray(priceTable.peakHours) ? priceTable.peakHours : DEFAULT_PRICE_TABLE.peakHours;
+    segmentWrap.innerHTML = peaks.map((pair, index) => {
+      const start = hoursToTime(pair[0]);
+      const end = hoursToTime(pair[1]);
+      return `<div class="dsh-tb-price-segment" data-seg-index="${index}">
+        <input type="time" class="dsh-tb-time-input" data-seg-role="start" step="300" value="${start}">
+        <span class="dsh-tb-time-dash">–</span>
+        <input type="time" class="dsh-tb-time-input" data-seg-role="end" step="300" value="${end}">
+        <button class="dsh-tb-price-seg-del" data-seg-del type="button" title="删除该时段">×</button>
+      </div>`;
+    }).join("") || `<div class="dsh-tb-panel-muted">暂未设置时段（将始终按谷价计费）</div>`;
+    segmentWrap.querySelectorAll("[data-seg-del]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const row = btn.closest(".dsh-tb-price-segment");
+        const index = Number(row && row.dataset.segIndex);
+        if (Number.isInteger(index) && Array.isArray(priceTable.peakHours)) {
+          priceTable.peakHours.splice(index, 1);
+          renderSegments();
+        }
+      });
+    });
+  };
   const renderPriceForm = () => {
     ensurePriceTable();
     const model = activePriceModel();
@@ -818,20 +902,10 @@ function attachPricingForm(root) {
       const key = input.dataset.rateKey;
       input.value = String(modelTable[scope][key]);
     }
-    const savedPeaks = Array.isArray(priceTable.peakHours) && priceTable.peakHours.length > 0
-      ? priceTable.peakHours
-      : DEFAULT_PRICE_TABLE.peakHours;
-    const peakHours = DEFAULT_PRICE_TABLE.peakHours.map((pair, index) => {
-      const saved = savedPeaks[index] || pair;
-      return [Number(saved[0]), Number(saved[1])];
-    });
-    for (const input of peakInputs) {
-      const idx = Number(input.dataset.peakIndex);
-      const edge = input.dataset.peakEdge;
-      const pair = peakHours[idx] || [];
-      input.value = String(edge === "start" ? pair[0] : pair[1]);
-    }
+    renderWeekdays();
+    renderSegments();
   };
+  /** 读取表单：价格 + 星期 + 时段，返回可保存的完整价格表。 */
   const readPriceForm = () => {
     ensurePriceTable();
     const model = activePriceModel();
@@ -842,25 +916,23 @@ function attachPricingForm(root) {
       if (!Number.isFinite(value) || value < 0) throw new Error("价格必须是非负数字");
       priceTable.models[model][scope][key] = value;
     }
-    const savedPeaks = Array.isArray(priceTable.peakHours) && priceTable.peakHours.length > 0
-      ? priceTable.peakHours
-      : DEFAULT_PRICE_TABLE.peakHours;
-    const peakHours = DEFAULT_PRICE_TABLE.peakHours.map((pair, index) => {
-      const saved = savedPeaks[index] || pair;
-      return [Number(saved[0]), Number(saved[1])];
-    });
-    for (const input of peakInputs) {
-      const idx = Number(input.dataset.peakIndex);
-      const edge = input.dataset.peakEdge;
-      const value = Number(input.value.trim());
-      if (!Number.isInteger(value) || value < 0 || value > 23) throw new Error("峰谷时段必须是 0-23 的整数小时");
-      peakHours[idx][edge === "start" ? 0 : 1] = value;
+    // 星期：读取当前圆圈激活态（不要求至少一天，全关=全天谷价）
+    priceTable.weekdays = Array.from(weekdayWrap.querySelectorAll(".dsh-tb-price-day.dsh-tb-price-day-on"))
+      .map((btn) => Number(btn.dataset.day))
+      .sort((a, b) => a - b);
+    // 时段：读取每行时间输入
+    const peakHours = [];
+    for (const row of segmentWrap.querySelectorAll(".dsh-tb-price-segment")) {
+      const startText = row.querySelector('[data-seg-role="start"]').value;
+      const endText = row.querySelector('[data-seg-role="end"]').value;
+      const start = timeToHours(startText, false);
+      const end = timeToHours(endText, true);
+      if (start === null || end === null) throw new Error("时段时间格式不正确（HH:MM，分钟按 5 分钟步进）");
+      if (start >= end) throw new Error("时段开始必须早于结束");
+      peakHours.push([start, end]);
     }
-    for (const [start, end] of peakHours) {
-      if (start >= end) throw new Error("峰谷时段开始必须小于结束");
-    }
-    priceTable.version = "desktop-custom";
     priceTable.peakHours = peakHours;
+    priceTable.version = "desktop-custom";
     return priceTable;
   };
   const savePricing = async (table) => {
@@ -886,6 +958,15 @@ function attachPricingForm(root) {
     });
   }
   if (priceModel) priceModel.addEventListener("change", () => renderPriceForm());
+  if (addSegmentBtn) {
+    addSegmentBtn.addEventListener("click", () => {
+      ensurePriceTable();
+      if (!Array.isArray(priceTable.peakHours)) priceTable.peakHours = [];
+      // 默认新增 09:00 – 12:00 一段，可即时编辑
+      priceTable.peakHours.push([9, 12]);
+      renderSegments();
+    });
+  }
   if (priceReset) {
     priceReset.addEventListener("click", async (event) => {
       event.preventDefault();
@@ -909,7 +990,7 @@ function attachPricingForm(root) {
       try {
         setPriceStatus("保存中");
         await savePricing(readPriceForm());
-        setPriceStatus("✓ 已保存，立即生效", { ok: true });
+        setPriceStatus("已保存，立即生效", { ok: true });
         refreshSeason();
       } catch (error) {
         setPriceStatus(error instanceof Error ? error.message : "保存失败", { err: true });
@@ -946,7 +1027,7 @@ const SETTINGS_DIALOG_CSS = `
 }
 .dsh-set-card {
   width: 660px; max-width: calc(100vw - 40px);
-  height: 500px; max-height: calc(100vh - 60px);
+  height: 620px; max-height: calc(100vh - 60px);
   display: flex; flex-direction: column;
   border-radius: 16px; overflow: hidden;
   background: var(--dsw-alias-bg-module-platform, #171b24);
@@ -960,7 +1041,7 @@ const SETTINGS_DIALOG_CSS = `
   border-bottom: 1px solid var(--dsw-alias-border-l2, rgba(128,128,128,.28));
 }
 .dsh-set-mark { color: var(--dsh-set-accent); flex: none; display: block; }
-.dsh-set-title { font-size: 13.5px; font-weight: 600; flex: 1; letter-spacing: .02em; }
+.dsh-set-title { font-size: 14px; font-weight: 400; flex: 1; letter-spacing: .04em; }
 .dsh-set-close {
   -webkit-app-region: no-drag;
   appearance: none; border: none; background: transparent; cursor: pointer;
@@ -983,23 +1064,25 @@ const SETTINGS_DIALOG_CSS = `
   appearance: none; border: none; background: transparent; cursor: pointer;
   text-align: left; width: 100%;
   padding: 9px 12px; border-radius: 9px;
-  font: inherit; font-size: 12.5px; font-weight: 500;
+  font: inherit; font-size: 12.5px; font-weight: 400;
   letter-spacing: .06em;
   color: var(--dsw-alias-label-secondary, #aeb3bd);
   transition: background .14s ease, color .14s ease, transform .08s ease;
 }
 .dsh-set-nav:hover { background: var(--dsw-alias-interactive-bg-hover, rgba(255,255,255,.07)); color: var(--dsw-alias-label-primary, #e8eaf0); }
 .dsh-set-nav:active { transform: scale(.98); }
+.dsh-set-nav:focus { outline: none; }
+.dsh-set-nav:focus-visible { outline: none; }
 .dsh-set-nav.dsh-set-nav-on {
   background: color-mix(in srgb, var(--dsh-set-accent) 15%, transparent);
   color: var(--dsh-set-accent);
-  font-weight: 600;
+  font-weight: 400;
 }
-.dsh-set-content { flex: 1; min-width: 0; padding: 16px 18px; overflow-y: auto; display: flex; flex-direction: column; }
+.dsh-set-content { flex: 1; min-width: 0; padding: 16px 18px 26px; overflow-y: auto; display: flex; flex-direction: column; }
 .dsh-set-panel { display: none; flex-direction: column; min-height: 0; flex: 1; }
 .dsh-set-panel.dsh-set-panel-on { display: flex; }
 .dsh-set-panel-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 12px; }
-.dsh-set-panel-title { font-size: 15px; font-weight: 700; letter-spacing: .03em; }
+.dsh-set-panel-title { font-size: 15px; font-weight: 400; letter-spacing: .05em; }
 .dsh-set-panel-sub { font-size: 11.5px; color: var(--dsw-alias-label-tertiary, #8a8f98); font-variant-numeric: tabular-nums; }
 /* 频道滑块：滑动药丸 */
 .dsh-set-channel { display: flex; align-items: center; gap: 14px; margin: 2px 0 12px; }
@@ -1024,13 +1107,15 @@ const SETTINGS_DIALOG_CSS = `
   appearance: none; border: none; cursor: pointer;
   position: relative; z-index: 1;
   padding: 5px 18px; border-radius: 7px;
-  font: inherit; font-size: 12px; font-weight: 500;
+  font: inherit; font-size: 12px; font-weight: 400;
   letter-spacing: .05em;
   color: var(--dsw-alias-label-secondary, #aeb3bd);
   background: transparent;
   transition: color .16s ease;
 }
 .dsh-set-seg-btn.dsh-set-seg-on { color: #fff; }
+.dsh-set-seg-btn:focus { outline: none; }
+.dsh-set-seg-btn:focus-visible { outline: none; }
 /* 版本列表 */
 .dsh-set-version-list {
   flex: 1; min-height: 120px; overflow-y: auto;
@@ -1047,7 +1132,7 @@ const SETTINGS_DIALOG_CSS = `
 .dsh-set-version-row:hover { background: var(--dsw-alias-interactive-bg-hover, rgba(255,255,255,.05)); }
 .dsh-set-version-name {
   font-family: var(--ds-font-mono, ui-monospace, "Fragment Mono", Consolas, monospace);
-  font-weight: 600;
+  font-weight: 400;
   color: var(--dsw-alias-label-primary, #e8eaf0); flex: 1; min-width: 0;
 }
 .dsh-set-version-tag { flex: none; font-size: 11px; padding: 2px 8px; border-radius: 6px; letter-spacing: .02em; }
@@ -1069,7 +1154,7 @@ const SETTINGS_DIALOG_CSS = `
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .dsh-set-version-foot-status.dsh-set-foot-ok { color: #34c56b; }
-.dsh-set-version-foot-status.dsh-set-foot-new { color: var(--dsh-set-accent); font-weight: 500; }
+.dsh-set-version-foot-status.dsh-set-foot-new { color: var(--dsh-set-accent); font-weight: 400; }
 .dsh-set-version-foot-status.dsh-set-foot-err { color: #e45555; }
 .dsh-set-version-foot-actions { display: inline-flex; align-items: center; gap: 8px; flex: none; }
 /* 按钮 */
@@ -1077,11 +1162,13 @@ const SETTINGS_DIALOG_CSS = `
   -webkit-app-region: no-drag;
   appearance: none; border: none; cursor: pointer;
   padding: 6px 14px; border-radius: 9px;
-  font: inherit; font-size: 12px; font-weight: 500;
+  font: inherit; font-size: 12px; font-weight: 400;
   letter-spacing: .03em;
   transition: filter .14s ease, background .14s ease, transform .06s ease;
 }
 .dsh-set-btn:active { transform: scale(.97); }
+.dsh-set-btn:focus { outline: none; }
+.dsh-set-btn:focus-visible { outline: none; }
 .dsh-set-btn-primary { background: var(--dsh-set-accent); color: #fff; }
 .dsh-set-btn-primary:hover { filter: brightness(1.08); }
 .dsh-set-btn-primary:disabled { opacity: .55; cursor: default; }
@@ -1090,20 +1177,22 @@ const SETTINGS_DIALOG_CSS = `
   border: 1px solid var(--dsw-alias-border-l2, rgba(128,128,128,.3));
 }
 .dsh-set-btn-ghost:hover { background: var(--dsw-alias-interactive-bg-hover, rgba(255,255,255,.07)); color: var(--dsw-alias-label-primary, #e8eaf0); }
+.dsh-set-btn-ghost:focus { outline: none; }
+.dsh-set-btn-ghost:focus-visible { outline: none; }
 .dsh-set-btn-sm { padding: 3px 12px; font-size: 11.5px; }
 /* 通用设置 */
 .dsh-set-section {
-  padding: 14px;
+  padding: 12px 14px;
   border: 1px solid var(--dsw-alias-border-l2, rgba(128,128,128,.22));
   border-radius: 12px;
   background: var(--dsw-alias-bg-base, #171b24);
   transition: border-color .15s ease;
 }
 .dsh-set-section:hover { border-color: var(--dsw-alias-border-l2, rgba(128,128,128,.34)); }
-.dsh-set-section + .dsh-set-section { margin-top: 12px; }
+.dsh-set-section + .dsh-set-section { margin-top: 10px; }
 .dsh-set-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
 .dsh-set-row-text { min-width: 0; }
-.dsh-set-row-title { font-size: 13px; font-weight: 600; letter-spacing: .03em; }
+.dsh-set-row-title { font-size: 13px; font-weight: 400; letter-spacing: .04em; }
 .dsh-set-row-sub { font-size: 11.5px; color: var(--dsw-alias-label-tertiary, #8a8f98); margin-top: 7px; letter-spacing: .01em; line-height: 1.5; }
 /* 开关：带弹性动效 */
 .dsh-set-switch { position: relative; display: inline-block; flex: none; width: 40px; height: 23px; }
@@ -1135,9 +1224,11 @@ const SETTINGS_DIALOG_CSS = `
   transition: background .14s ease;
 }
 .dsh-set-subsection-head:hover { background: var(--dsw-alias-interactive-bg-hover, rgba(255,255,255,.06)); }
+.dsh-set-subsection-head:focus { outline: none; }
+.dsh-set-subsection-head:focus-visible { outline: none; }
 .dsh-set-subsection-title {
   display: flex; align-items: center; gap: 8px;
-  font-size: 12px; font-weight: 600; letter-spacing: .05em;
+  font-size: 12px; font-weight: 400; letter-spacing: .06em;
   color: var(--dsw-alias-label-secondary, #b4b9c2);
 }
 .dsh-set-subsection-title::before {
@@ -1155,7 +1246,7 @@ const SETTINGS_DIALOG_CSS = `
   overflow: hidden;
   transition: max-height .22s cubic-bezier(.2,.7,.3,1);
 }
-.dsh-set-subsection-body.dsh-set-subsection-open { max-height: 520px; }
+.dsh-set-subsection-body.dsh-set-subsection-open { max-height: 760px; }
 /* 白色表单卡片（紧凑：小号控件 + 宽松间距，避免挤压感） */
 .dsh-set-subsection-inner {
   margin-top: 8px;
@@ -1202,8 +1293,8 @@ const SETTINGS_DIALOG_CSS = `
 #dsh-settings-dialog .dsh-tb-price-grid > span {
   font-size: 11px; letter-spacing: .03em; color: #5b6478;
 }
-#dsh-settings-dialog .dsh-tb-price-grid > span:nth-child(2) { color: #16a34a; font-weight: 600; }
-#dsh-settings-dialog .dsh-tb-price-grid > span:nth-child(3) { color: #d97706; font-weight: 600; }
+#dsh-settings-dialog .dsh-tb-price-grid > span:nth-child(2) { color: #16a34a; font-weight: 400; }
+#dsh-settings-dialog .dsh-tb-price-grid > span:nth-child(3) { color: #d97706; font-weight: 400; }
 #dsh-settings-dialog .dsh-tb-price-input {
   width: 100%; height: 26px; padding: 0 8px;
   border: 1px solid #d9dfeb;
@@ -1223,18 +1314,74 @@ const SETTINGS_DIALOG_CSS = `
 }
 #dsh-settings-dialog .dsh-tb-price-input::placeholder { color: #9aa3b5; }
 #dsh-settings-dialog .dsh-tb-price-peak-title {
-  margin-top: 10px;
+  margin-top: 12px;
   font-size: 11px; letter-spacing: .03em;
   color: #5b6478;
 }
-#dsh-settings-dialog .dsh-tb-price-peak {
-  margin-top: 6px;
-  display: flex; align-items: center; gap: 5px; flex-wrap: wrap;
+/* 峰谷日期：圆形切换按钮（一 ～ 日，蓝色=激活） */
+#dsh-settings-dialog .dsh-tb-price-weekdays {
+  margin-top: 8px;
+  display: flex; align-items: center; gap: 6px;
 }
-#dsh-settings-dialog .dsh-tb-price-peak + .dsh-tb-price-peak { margin-top: 4px; }
-#dsh-settings-dialog .dsh-tb-peak-input {
-  width: 44px; height: 26px; flex: none; text-align: center; font-size: 11.5px;
+#dsh-settings-dialog .dsh-tb-price-day {
+  -webkit-app-region: no-drag;
+  appearance: none; cursor: pointer;
+  width: 30px; height: 30px; border-radius: 50%;
+  border: 1px solid #d9dfeb; background: #f7f9fc; color: #5b6478;
+  font: inherit; font-size: 12px; letter-spacing: .02em;
+  display: inline-flex; align-items: center; justify-content: center;
+  transition: background .15s ease, border-color .15s ease, color .15s ease, box-shadow .15s ease, transform .06s ease;
 }
+#dsh-settings-dialog .dsh-tb-price-day:hover { border-color: color-mix(in srgb, #4d6bfe 55%, #d9dfeb); color: #4d6bfe; }
+#dsh-settings-dialog .dsh-tb-price-day:active { transform: scale(.94); }
+#dsh-settings-dialog .dsh-tb-price-day.dsh-tb-price-day-on {
+  background: linear-gradient(135deg, #4d6bfe, #6f8bff);
+  border-color: transparent; color: #fff;
+  box-shadow: 0 2px 8px rgba(77, 107, 254, .35);
+}
+/* 峰谷时段：动态行 + 时间输入 + 删除 */
+#dsh-settings-dialog .dsh-tb-price-segments {
+  margin-top: 8px;
+  display: flex; flex-direction: column; gap: 6px;
+}
+#dsh-settings-dialog .dsh-tb-price-segment {
+  display: flex; align-items: center; gap: 7px;
+}
+#dsh-settings-dialog .dsh-tb-time-input {
+  flex: 1; min-width: 0; height: 28px; padding: 0 8px;
+  border: 1px solid #d9dfeb; border-radius: 8px;
+  background: #f7f9fc; color: #1f2430;
+  font: inherit; font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  outline: none; color-scheme: light;
+  transition: border-color .14s ease, box-shadow .14s ease, background .14s ease;
+}
+#dsh-settings-dialog .dsh-tb-time-input:hover { border-color: color-mix(in srgb, #4d6bfe 45%, #d9dfeb); }
+#dsh-settings-dialog .dsh-tb-time-input:focus {
+  border-color: #4d6bfe;
+  box-shadow: 0 0 0 3px rgba(77, 107, 254, .18);
+  background: #ffffff;
+}
+#dsh-settings-dialog .dsh-tb-time-dash { color: #9aa3b5; flex: none; }
+#dsh-settings-dialog .dsh-tb-price-seg-del {
+  -webkit-app-region: no-drag;
+  appearance: none; cursor: pointer; flex: none;
+  width: 26px; height: 26px; border-radius: 7px;
+  border: 1px solid #d9dfeb; background: transparent; color: #9aa3b5;
+  font: inherit; font-size: 14px; line-height: 1;
+  display: inline-flex; align-items: center; justify-content: center;
+  transition: border-color .14s ease, color .14s ease, background .14s ease;
+}
+#dsh-settings-dialog .dsh-tb-price-seg-del:hover { border-color: #dc2626; color: #dc2626; background: rgba(220, 38, 38, .06); }
+#dsh-settings-dialog .dsh-tb-price-add {
+  -webkit-app-region: no-drag;
+  appearance: none; cursor: pointer;
+  margin-top: 8px; height: 27px; padding: 0 12px; border-radius: 8px;
+  border: 1px dashed #c6cede; background: transparent; color: #5b6478;
+  font: inherit; font-size: 11.5px; letter-spacing: .02em;
+  transition: border-color .14s ease, color .14s ease;
+}
+#dsh-settings-dialog .dsh-tb-price-add:hover { border-color: #4d6bfe; color: #4d6bfe; }
 #dsh-settings-dialog .dsh-tb-price-actions {
   margin-top: 10px;
   display: flex; align-items: center; justify-content: space-between; gap: 8px;
@@ -1243,8 +1390,8 @@ const SETTINGS_DIALOG_CSS = `
   min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   font-size: 11px; color: #5b6478;
 }
-#dsh-settings-dialog .dsh-tb-price-status.dsh-tb-price-status-ok { color: #16a34a; font-weight: 600; }
-#dsh-settings-dialog .dsh-tb-price-status.dsh-tb-price-status-err { color: #dc2626; font-weight: 600; }
+#dsh-settings-dialog .dsh-tb-price-status.dsh-tb-price-status-ok { color: #16a34a; font-weight: 400; }
+#dsh-settings-dialog .dsh-tb-price-status.dsh-tb-price-status-err { color: #dc2626; font-weight: 400; }
 #dsh-settings-dialog .dsh-tb-price-buttons { display: inline-flex; align-items: center; gap: 6px; flex: none; }
 #dsh-settings-dialog .dsh-tb-price-btn {
   -webkit-app-region: no-drag;
@@ -1252,7 +1399,7 @@ const SETTINGS_DIALOG_CSS = `
   height: 26px; padding: 0 12px; border-radius: 8px;
   border: 1px solid #d9dfeb;
   background: transparent; color: #334155;
-  font: inherit; font-size: 11.5px; font-weight: 500;
+  font: inherit; font-size: 11.5px; font-weight: 400;
   transition: background .14s ease, color .14s ease, transform .06s ease;
 }
 #dsh-settings-dialog .dsh-tb-price-btn:hover { background: #f1f5f9; color: #1f2430; }
@@ -1264,6 +1411,59 @@ const SETTINGS_DIALOG_CSS = `
   box-shadow: 0 3px 10px rgba(77,107,254,.35);
 }
 #dsh-settings-dialog .dsh-tb-price-btn.dsh-tb-price-btn-primary:hover { filter: brightness(1.08); box-shadow: 0 4px 14px rgba(77,107,254,.42); }
+/* ===== Llama 启动器 ===== */
+.dsh-llama-badge {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 11px; font-weight: 400; letter-spacing: .02em;
+  padding: 2px 8px; border-radius: 6px; vertical-align: 1px; margin-left: 6px;
+}
+.dsh-llama-badge::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex: none; }
+.dsh-llama-badge-stopped { background: rgba(128,128,128,.16); color: var(--dsw-alias-label-tertiary, #8a8f98); }
+.dsh-llama-badge-starting { background: rgba(217,119,6,.16); color: #e8a33d; }
+.dsh-llama-badge-starting::before { animation: dsh-llama-pulse 1s ease-in-out infinite; }
+.dsh-llama-badge-running { background: color-mix(in srgb, #2ea043 18%, transparent); color: #34c56b; }
+.dsh-llama-badge-error { background: color-mix(in srgb, #e45555 18%, transparent); color: #e45555; }
+@keyframes dsh-llama-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+.dsh-llama-actions { display: inline-flex; align-items: center; gap: 8px; flex: none; }
+.dsh-llama-title-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.dsh-llama-refresh {
+  color: var(--dsh-set-accent, #4d6bfe);
+  border-color: color-mix(in srgb, var(--dsh-set-accent, #4d6bfe) 35%, transparent);
+}
+.dsh-llama-refresh:hover {
+  background: var(--dsh-set-accent, #4d6bfe);
+  border-color: var(--dsh-set-accent, #4d6bfe);
+  color: #fff;
+}
+.dsh-llama-mono {
+  font-family: var(--ds-font-mono, ui-monospace, "Fragment Mono", Consolas, monospace);
+  font-size: 11px; word-break: break-all;
+}
+.dsh-llama-select {
+  -webkit-app-region: no-drag;
+  appearance: none; -webkit-appearance: none;
+  width: 100%; margin-top: 9px; height: 30px; padding: 0 28px 0 10px;
+  border: 1px solid var(--dsw-alias-border-l2, rgba(128,128,128,.3));
+  border-radius: 8px;
+  background-color: var(--dsw-alias-bg-base, #171b24);
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 10 10'%3E%3Cpath d='M2 3.5 L5 6.5 L8 3.5' fill='none' stroke='%238a8f98' stroke-width='1.3' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat; background-position: right 9px center;
+  color: var(--dsw-alias-label-primary, #e8eaf0);
+  font: inherit; font-size: 12px;
+  cursor: pointer; outline: none;
+  transition: border-color .14s ease;
+}
+.dsh-llama-select:hover, .dsh-llama-select:focus { border-color: color-mix(in srgb, var(--dsh-set-accent) 55%, rgba(128,128,128,.3)); }
+.dsh-llama-select-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+.dsh-llama-select-row:first-of-type { margin-top: 9px; }
+.dsh-llama-select-row .dsh-llama-select { margin-top: 0; flex: 1; min-width: 0; }
+#dsh-settings-dialog .dsh-llama-param-grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 9px 10px;
+}
+#dsh-settings-dialog .dsh-llama-field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+#dsh-settings-dialog .dsh-llama-field > span { font-size: 11px; letter-spacing: .03em; color: #5b6478; }
+#dsh-settings-dialog .dsh-llama-field-wide { grid-column: 1 / -1; }
+#dsh-settings-dialog .dsh-llama-field input { width: 100%; }
 `;
 
 const PRICING_FORM_HTML = `
@@ -1286,26 +1486,36 @@ const PRICING_FORM_HTML = `
     <input class="dsh-tb-price-input" data-rate-scope="offPeak" data-rate-key="output" inputmode="decimal">
     <input class="dsh-tb-price-input" data-rate-scope="peak" data-rate-key="output" inputmode="decimal">
   </div>
-  <div class="dsh-tb-price-peak-title">峰谷时段（DeepSeek 多段，24 小时制）</div>
-  <div class="dsh-tb-price-peak">
-    <span class="dsh-tb-panel-muted">段1</span>
-    <input class="dsh-tb-price-input dsh-tb-peak-input" data-peak-index="0" data-peak-edge="start" inputmode="numeric" title="第 1 段开始（时）">
-    <span class="dsh-tb-panel-muted">–</span>
-    <input class="dsh-tb-price-input dsh-tb-peak-input" data-peak-index="0" data-peak-edge="end" inputmode="numeric" title="第 1 段结束（时）">
-    <span class="dsh-tb-panel-muted">时</span>
-  </div>
-  <div class="dsh-tb-price-peak">
-    <span class="dsh-tb-panel-muted">段2</span>
-    <input class="dsh-tb-price-input dsh-tb-peak-input" data-peak-index="1" data-peak-edge="start" inputmode="numeric" title="第 2 段开始（时）">
-    <span class="dsh-tb-panel-muted">–</span>
-    <input class="dsh-tb-price-input dsh-tb-peak-input" data-peak-index="1" data-peak-edge="end" inputmode="numeric" title="第 2 段结束（时）">
-    <span class="dsh-tb-panel-muted">时</span>
-  </div>
+  <div class="dsh-tb-price-peak-title">峰谷日期（点击圆圈切换，蓝色=当天执行峰谷计费）</div>
+  <div class="dsh-tb-price-weekdays" id="dsh-tb-price-weekdays"></div>
+  <div class="dsh-tb-price-peak-title">峰谷时段（自定义，结束 00:00 表示次日零点）</div>
+  <div class="dsh-tb-price-segments" id="dsh-tb-price-segments"></div>
+  <button class="dsh-tb-price-add" id="dsh-tb-price-add" type="button">添加时段</button>
   <div class="dsh-tb-price-actions">
     <span class="dsh-tb-price-status" id="dsh-tb-price-status">读取中</span>
     <span class="dsh-tb-price-buttons">
       <button class="dsh-tb-price-btn" id="dsh-tb-price-reset" type="button">默认</button>
       <button class="dsh-tb-price-btn dsh-tb-price-btn-primary" id="dsh-tb-price-save" type="button">保存</button>
+    </span>
+  </div>
+`;
+
+/** Llama 启动器：运行参数表单（白色纸面，与计费表单同风格）。 */
+const LLAMA_PARAMS_FORM_HTML = `
+  <div class="dsh-llama-param-grid">
+    <label class="dsh-llama-field"><span>监听端口</span><input class="dsh-tb-price-input" id="dsh-llama-port" inputmode="numeric" placeholder="8080"></label>
+    <label class="dsh-llama-field"><span>上下文长度 -c</span><input class="dsh-tb-price-input" id="dsh-llama-ctx" inputmode="numeric" placeholder="4096"></label>
+    <label class="dsh-llama-field"><span>GPU 层数 -ngl（0=纯 CPU）</span><input class="dsh-tb-price-input" id="dsh-llama-ngl" inputmode="numeric" placeholder="999"></label>
+    <label class="dsh-llama-field"><span>线程数 -t（0=自动）</span><input class="dsh-tb-price-input" id="dsh-llama-threads" inputmode="numeric" placeholder="0"></label>
+    <label class="dsh-llama-field"><span>并行会话 -np</span><input class="dsh-tb-price-input" id="dsh-llama-np" inputmode="numeric" placeholder="1"></label>
+    <label class="dsh-llama-field"><span>API Key（可选）</span><input class="dsh-tb-price-input" id="dsh-llama-apikey" placeholder="留空不校验"></label>
+    <label class="dsh-llama-field dsh-llama-field-wide"><span>附加参数（空格分隔，支持双引号）</span><input class="dsh-tb-price-input" id="dsh-llama-extra" placeholder="例如：--jinja --no-mmap"></label>
+  </div>
+  <div class="dsh-tb-price-actions">
+    <span class="dsh-tb-price-status" id="dsh-llama-params-status"></span>
+    <span class="dsh-tb-price-buttons">
+      <button class="dsh-tb-price-btn" id="dsh-llama-params-reset" type="button">恢复默认</button>
+      <button class="dsh-tb-price-btn dsh-tb-price-btn-primary" id="dsh-llama-params-save" type="button">保存参数</button>
     </span>
   </div>
 `;
@@ -1331,6 +1541,7 @@ function ensureSettingsDialog() {
         <div class="dsh-set-sidebar">
           <button class="dsh-set-nav dsh-set-nav-on" data-panel="versions" type="button">Harness 版本</button>
           <button class="dsh-set-nav" data-panel="general" type="button">通用</button>
+          <button class="dsh-set-nav" data-panel="llama" type="button">llama 启动器</button>
         </div>
         <div class="dsh-set-content">
           <section class="dsh-set-panel dsh-set-panel-on" data-panel="versions">
@@ -1386,6 +1597,76 @@ function ensureSettingsDialog() {
               </div>
             </div>
           </section>
+          <section class="dsh-set-panel" data-panel="llama">
+            <div class="dsh-set-panel-head">
+              <div class="dsh-set-panel-title">llama 启动器</div>
+              <div class="dsh-set-panel-sub" id="dsh-llama-head-sub">本地模型服务 llama-server</div>
+            </div>
+            <div class="dsh-set-section">
+              <div class="dsh-set-row">
+                <div class="dsh-set-row-text">
+                  <div class="dsh-set-row-title">服务状态 <span class="dsh-llama-badge dsh-llama-badge-stopped" id="dsh-llama-badge">已停止</span></div>
+                  <div class="dsh-set-row-sub" id="dsh-llama-state-detail">在软件内一键启动 llama-server，提供 OpenAI 兼容接口</div>
+                </div>
+                <span class="dsh-llama-actions">
+                  <button class="dsh-set-btn dsh-set-btn-primary dsh-set-btn-sm" id="dsh-llama-start" type="button">启动服务</button>
+                  <button class="dsh-set-btn dsh-set-btn-ghost dsh-set-btn-sm" id="dsh-llama-stop" type="button" disabled>停止</button>
+                </span>
+              </div>
+            </div>
+            <div class="dsh-set-section">
+              <div class="dsh-set-row">
+                <div class="dsh-set-row-text">
+                  <div class="dsh-set-row-title">跟随软件启动</div>
+                  <div class="dsh-set-row-sub">软件启动时自动拉起 llama-server，退出软件时自动停止</div>
+                </div>
+                <label class="dsh-set-switch"><input type="checkbox" id="dsh-llama-autostart"><span class="dsh-set-switch-track"></span></label>
+              </div>
+            </div>
+            <div class="dsh-set-section">
+              <div class="dsh-set-row">
+                <div class="dsh-set-row-text">
+                  <div class="dsh-set-row-title">llama.cpp 目录</div>
+                  <div class="dsh-set-row-sub dsh-llama-mono" id="dsh-llama-dir-path">未设置</div>
+                </div>
+                <span class="dsh-llama-actions">
+                  <button class="dsh-set-btn dsh-set-btn-ghost dsh-set-btn-sm" id="dsh-llama-browse-dir" type="button">浏览…</button>
+                </span>
+              </div>
+            </div>
+            <div class="dsh-set-section">
+              <div class="dsh-set-row">
+                <div class="dsh-set-row-text" style="flex: 1; min-width: 0;">
+                  <div class="dsh-set-row-title dsh-llama-title-row">
+                    <span>模型</span>
+                    <button class="dsh-set-btn dsh-set-btn-ghost dsh-set-btn-sm dsh-llama-refresh" id="dsh-llama-model-refresh" type="button">刷新</button>
+                  </div>
+                  <div class="dsh-set-row-sub">主模型与视觉模型（mmproj，可选）</div>
+                  <div class="dsh-llama-select-row">
+                    <select class="dsh-llama-select" id="dsh-llama-model"></select>
+                    <button class="dsh-set-btn dsh-set-btn-ghost dsh-set-btn-sm" id="dsh-llama-model-browse" type="button">浏览…</button>
+                  </div>
+                  <div class="dsh-llama-select-row">
+                    <select class="dsh-llama-select" id="dsh-llama-mmproj"></select>
+                    <button class="dsh-set-btn dsh-set-btn-ghost dsh-set-btn-sm" id="dsh-llama-mmproj-browse" type="button">浏览…</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div class="dsh-set-section">
+              <div class="dsh-set-subsection" style="margin-top: 0;">
+                <button class="dsh-set-subsection-head" id="dsh-llama-params-toggle" type="button" aria-expanded="false">
+                  <span class="dsh-set-subsection-title">运行参数（高级）</span>
+                  <svg class="dsh-tb-action-caret" width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
+                    <path d="M3 1.5 L6.5 5 L3 8.5" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>
+                  </svg>
+                </button>
+                <div class="dsh-set-subsection-body" id="dsh-llama-params-body">
+                  <div class="dsh-set-subsection-inner">${LLAMA_PARAMS_FORM_HTML}</div>
+                </div>
+              </div>
+            </div>
+          </section>
         </div>
       </div>
     </div>`;
@@ -1426,11 +1707,90 @@ function ensureSettingsDialog() {
   if (!pricingControls) {
     pricingControls = attachPricingForm(pricingInner);
   }
+  // Llama 启动器：跟随启动开关 / 启停按钮 / 目录与模型选择 / 参数表单
+  const llamaAutoInput = settingsDialogEl.querySelector("#dsh-llama-autostart");
+  llamaAutoInput.addEventListener("change", () => api.llamaSave({ autoStart: llamaAutoInput.checked }));
+  settingsDialogEl.querySelector("#dsh-llama-start").addEventListener("click", () => api.llamaStart());
+  settingsDialogEl.querySelector("#dsh-llama-stop").addEventListener("click", () => api.llamaStop());
+  settingsDialogEl.querySelector("#dsh-llama-browse-dir").addEventListener("click", async () => {
+    const dir = await api.llamaBrowseDir();
+    if (dir && typeof dir === "string") {
+      api.llamaSave({ dir });
+      setTimeout(refreshLlamaPanel, 250);
+    }
+  });
+  const llamaModelSelect = settingsDialogEl.querySelector("#dsh-llama-model");
+  llamaModelSelect.addEventListener("change", () => {
+    if (llamaModelSelect.value) api.llamaSave({ modelPath: llamaModelSelect.value });
+  });
+  const llamaMmprojSelect = settingsDialogEl.querySelector("#dsh-llama-mmproj");
+  llamaMmprojSelect.addEventListener("change", () => {
+    api.llamaSave({ mmprojPath: llamaMmprojSelect.value || "" });
+  });
+  settingsDialogEl.querySelector("#dsh-llama-mmproj-browse").addEventListener("click", async () => {
+    const file = await api.llamaBrowseModel();
+    if (file && typeof file === "string") {
+      api.llamaSave({ mmprojPath: file });
+      setTimeout(refreshLlamaPanel, 250);
+    }
+  });
+  settingsDialogEl.querySelector("#dsh-llama-model-refresh").addEventListener("click", () => { refreshLlamaPanel(); });
+  settingsDialogEl.querySelector("#dsh-llama-model-browse").addEventListener("click", async () => {
+    const file = await api.llamaBrowseModel();
+    if (file && typeof file === "string") {
+      api.llamaSave({ modelPath: file });
+      setTimeout(refreshLlamaPanel, 250);
+    }
+  });
+  // 运行参数（高级）：可折叠
+  const llamaParamsToggle = settingsDialogEl.querySelector("#dsh-llama-params-toggle");
+  const llamaParamsBody = settingsDialogEl.querySelector("#dsh-llama-params-body");
+  llamaParamsToggle.addEventListener("click", () => {
+    const open = llamaParamsBody.classList.contains("dsh-set-subsection-open");
+    llamaParamsBody.classList.toggle("dsh-set-subsection-open", !open);
+    llamaParamsToggle.classList.toggle("dsh-set-subsection-on", !open);
+    llamaParamsToggle.setAttribute("aria-expanded", String(!open));
+  });
+  const llamaParamsStatus = (text, cls) => {
+    const el = settingsDialogEl.querySelector("#dsh-llama-params-status");
+    if (el) {
+      el.textContent = text;
+      el.className = "dsh-tb-price-status" + (cls ? " " + cls : "");
+    }
+  };
+  settingsDialogEl.querySelector("#dsh-llama-params-save").addEventListener("click", () => {
+    const num = (sel, fallback) => {
+      const raw = String(settingsDialogEl.querySelector(sel).value || "").trim();
+      if (raw === "") return fallback;
+      const n = Number(raw);
+      return Number.isFinite(n) ? Math.floor(n) : fallback;
+    };
+    const patch = {
+      port: num("#dsh-llama-port", 8080),
+      ctxSize: num("#dsh-llama-ctx", 4096),
+      gpuLayers: num("#dsh-llama-ngl", 999),
+      threads: num("#dsh-llama-threads", 0),
+      parallel: num("#dsh-llama-np", 1),
+      apiKey: String(settingsDialogEl.querySelector("#dsh-llama-apikey").value || ""),
+      extraArgs: String(settingsDialogEl.querySelector("#dsh-llama-extra").value || ""),
+    };
+    if (patch.port < 1 || patch.port > 65535) {
+      llamaParamsStatus("端口需在 1–65535 之间", "dsh-tb-price-status-err");
+      return;
+    }
+    api.llamaSave(patch);
+    llamaParamsStatus("参数已保存（下次启动服务时生效）", "dsh-tb-price-status-ok");
+  });
+  settingsDialogEl.querySelector("#dsh-llama-params-reset").addEventListener("click", () => {
+    api.llamaSave({ port: 8080, ctxSize: 4096, gpuLayers: 999, threads: 0, parallel: 1, apiKey: "", extraArgs: "" });
+    llamaParamsStatus("已恢复默认参数", "dsh-tb-price-status-ok");
+    setTimeout(refreshLlamaPanel, 250);
+  });
   return settingsDialogEl;
 }
 
 function selectSettingsPanel(panel) {
-  settingsPanelName = panel === "general" ? "general" : "versions";
+  settingsPanelName = panel === "general" ? "general" : panel === "llama" ? "llama" : "versions";
   settingsDialogEl.querySelectorAll(".dsh-set-nav").forEach((btn) => {
     btn.classList.toggle("dsh-set-nav-on", btn.dataset.panel === settingsPanelName);
   });
@@ -1438,6 +1798,7 @@ function selectSettingsPanel(panel) {
     sec.classList.toggle("dsh-set-panel-on", sec.dataset.panel === settingsPanelName);
   });
   if (settingsPanelName === "versions") refreshVersionList();
+  if (settingsPanelName === "llama") refreshLlamaPanel();
   syncSettingsSwitches();
 }
 
@@ -1477,6 +1838,130 @@ function syncSettingsSwitches() {
   settingsDialogEl.querySelectorAll("#dsh-set-channel-seg .dsh-set-seg-btn").forEach((btn) => {
     btn.classList.toggle("dsh-set-seg-on", btn.dataset.channel === channel);
   });
+  const llamaAuto = settingsDialogEl.querySelector("#dsh-llama-autostart");
+  if (llamaAuto) llamaAuto.checked = !!(appSettings.llama && appSettings.llama.autoStart);
+}
+
+// ---------- Llama 启动器（面板渲染与状态联动） ----------
+
+/** llama 面板数据缓存（来自主进程 dsh:llama-get）。 */
+let llamaData = null;
+/** llama-server 状态本地缓存（dsh:llama-status-changed 驱动）。 */
+let llamaStatusLocal = { state: "stopped" };
+
+const LLAMA_STATE_TEXT = {
+  stopped: ["已停止", "dsh-llama-badge-stopped"],
+  starting: ["启动中…", "dsh-llama-badge-starting"],
+  running: ["运行中", "dsh-llama-badge-running"],
+  error: ["错误", "dsh-llama-badge-error"],
+};
+
+function llamaModelLabel(model) {
+  const size = model.sizeMB >= 1024 ? `${(model.sizeMB / 1024).toFixed(1)} GB` : `${model.sizeMB} MB`;
+  return `${model.name}（${size}）`;
+}
+
+/** 拉取 llama 配置/模型列表/状态并渲染面板。 */
+async function refreshLlamaPanel() {
+  if (!settingsDialogEl) return;
+  try {
+    llamaData = await api.llamaGet();
+  } catch {
+    llamaData = null;
+  }
+  // 同步主进程当前状态：跟随启动等服务在启动页阶段就已就绪，
+  // 状态推送事件可能早于主界面 preload 注册监听，这里以主进程状态为准回填
+  if (llamaData && llamaData.status && typeof llamaData.status === "object") {
+    llamaStatusLocal = llamaData.status;
+  }
+  renderLlamaPanel();
+}
+
+function renderLlamaPanel() {
+  if (!settingsDialogEl) return;
+  if (llamaData && typeof llamaData === "object") {
+    const cfg = llamaData.config || {};
+    const dirPath = settingsDialogEl.querySelector("#dsh-llama-dir-path");
+    if (dirPath) {
+      dirPath.textContent = llamaData.serverExe
+        ? (cfg.dir || "未设置")
+        : (cfg.dir ? `${cfg.dir}（未找到 llama-server.exe）` : "未设置");
+      dirPath.style.color = llamaData.serverExe ? "" : "#e45555";
+    }
+    const select = settingsDialogEl.querySelector("#dsh-llama-model");
+    const mmprojSelect = settingsDialogEl.querySelector("#dsh-llama-mmproj");
+    if (select || mmprojSelect) {
+      const models = Array.isArray(llamaData.models) ? llamaData.models : [];
+      const current = typeof cfg.modelPath === "string" ? cfg.modelPath : "";
+      const currentMm = typeof cfg.mmprojPath === "string" ? cfg.mmprojPath : "";
+      // mmproj 文件：文件名以 mmproj 开头/包含（视觉投影）
+      const isMmproj = (m) => /(^|[\\/_-]?)mmproj/i.test(m.name) || /mmproj/i.test(m.path);
+      const mainModels = models.filter((m) => !isMmproj(m));
+      const mmModels = models.filter((m) => isMmproj(m));
+      if (select) {
+        let options = mainModels.map((m) =>
+          `<option value="${escHtml(m.path)}"${m.path === current ? " selected" : ""}>${escHtml(llamaModelLabel(m))}</option>`
+        ).join("");
+        if (mainModels.length === 0) {
+          options = `<option value="">（未发现主模型，请将 .gguf 放入 models/ 或点击浏览）</option>`;
+        }
+        if (current && !mainModels.some((m) => m.path === current)) {
+          options = `<option value="${escHtml(current)}" selected>${escHtml(current)}（自定义）</option>${options}`;
+        }
+        select.innerHTML = options;
+      }
+      if (mmprojSelect) {
+        let options = `<option value="">不使用视觉模型</option>` + mmModels.map((m) =>
+          `<option value="${escHtml(m.path)}"${m.path === currentMm ? " selected" : ""}>${escHtml(llamaModelLabel(m))}</option>`
+        ).join("");
+        if (currentMm && !mmModels.some((m) => m.path === currentMm)) {
+          options = `<option value="${escHtml(currentMm)}" selected>${escHtml(currentMm)}（自定义）</option>${options}`;
+        }
+        mmprojSelect.innerHTML = options;
+      }
+    }
+    const setVal = (id, value) => {
+      const el = settingsDialogEl.querySelector(id);
+      if (el) el.value = value === null || value === undefined ? "" : String(value);
+    };
+    setVal("#dsh-llama-port", cfg.port);
+    setVal("#dsh-llama-ctx", cfg.ctxSize);
+    setVal("#dsh-llama-ngl", cfg.gpuLayers);
+    setVal("#dsh-llama-threads", cfg.threads);
+    setVal("#dsh-llama-np", cfg.parallel);
+    setVal("#dsh-llama-apikey", cfg.apiKey);
+    setVal("#dsh-llama-extra", cfg.extraArgs);
+  }
+  updateLlamaStatusView();
+}
+
+/** 依据 llama-server 状态刷新徽标 / 详情 / 启停按钮。 */
+function updateLlamaStatusView(status) {
+  if (status && typeof status === "object") llamaStatusLocal = status;
+  if (!settingsDialogEl) return;
+  const st = llamaStatusLocal || {};
+  const state = st.state || "stopped";
+  const [badgeText, badgeCls] = LLAMA_STATE_TEXT[state] || LLAMA_STATE_TEXT.stopped;
+  const badge = settingsDialogEl.querySelector("#dsh-llama-badge");
+  if (badge) {
+    badge.textContent = badgeText;
+    badge.className = `dsh-llama-badge ${badgeCls}`;
+  }
+  const detail = settingsDialogEl.querySelector("#dsh-llama-state-detail");
+  if (detail) {
+    if (state === "running") {
+      // 两行展示：先接口地址，再 OpenAI 兼容前缀；去掉内联括号
+      detail.innerHTML = `接口就绪：${st.endpoint}<br>OpenAI 兼容前缀：${st.endpoint}/v1`;
+    } else if (state === "starting") detail.textContent = `正在加载模型，大模型可能需要数分钟${st.lastLog ? `：${st.lastLog}` : ""}`;
+    else if (state === "error") detail.textContent = st.error || "启动失败，请查看日志";
+    else detail.textContent = "在软件内一键启动 llama-server，提供 OpenAI 兼容接口";
+  }
+  const startBtn = settingsDialogEl.querySelector("#dsh-llama-start");
+  const stopBtn = settingsDialogEl.querySelector("#dsh-llama-stop");
+  if (startBtn) startBtn.disabled = state === "running" || state === "starting";
+  if (stopBtn) stopBtn.disabled = state === "stopped";
+  const head = settingsDialogEl.querySelector("#dsh-llama-head-sub");
+  if (head) head.textContent = state === "running" ? `运行中 · ${st.endpoint}` : "本地模型服务 llama-server";
 }
 
 /** 底部固定状态栏：状态文字固定不动（无布局跳动）。 */
@@ -3144,6 +3629,8 @@ function boot() {
     // 设置弹窗更新事件监听（新版本提示 / 安装进度 / 安装结果）与状态监听
     ipcRenderer.on("dsh:update-event", (_event, evt) => handleDesktopUpdateEvent(evt));
     ipcRenderer.on("dsh:update-status", (_event, status) => handleUpdateStatus(status));
+    // llama-server 状态实时刷新（启动中/运行中/错误徽标与启停按钮）
+    ipcRenderer.on("dsh:llama-status-changed", (_event, status) => updateLlamaStatusView(status));
     // 通知主进程：本页面 preload 已就绪（用于更新完成后重载页面的握手）
     ipcRenderer.send("dsh:renderer-ready");
     // 上报应用主题给主进程（持久化，供下次启动画面跟随主题）
@@ -3183,6 +3670,18 @@ const api = {
   },
   listVersions: () => ipcRenderer.invoke("dsh:list-versions"),
   installVersion: (version) => ipcRenderer.send("dsh:install-version", version),
+  // Llama 启动器
+  llamaGet: () => ipcRenderer.invoke("dsh:llama-get"),
+  llamaSave: (patch) => ipcRenderer.send("dsh:llama-save", patch),
+  llamaBrowseDir: () => ipcRenderer.invoke("dsh:llama-browse-dir"),
+  llamaBrowseModel: () => ipcRenderer.invoke("dsh:llama-browse-model"),
+  llamaStart: () => ipcRenderer.send("dsh:llama-start"),
+  llamaStop: () => ipcRenderer.send("dsh:llama-stop"),
+  onLlamaStatusChanged: (cb) => {
+    const listener = (_event, status) => cb(status);
+    ipcRenderer.on("dsh:llama-status-changed", listener);
+    return () => ipcRenderer.removeListener("dsh:llama-status-changed", listener);
+  },
   getPendingInstall: () => ipcRenderer.invoke("dsh:get-pending-install"),
   cancelInstall: () => ipcRenderer.send("dsh:cancel-install"),
   returnToApp: () => ipcRenderer.invoke("dsh:return-to-app"),

@@ -358,14 +358,53 @@ function log(line) {
   } catch { /* ignore */ }
 }
 
-// ---------- 桌面设置（settings.json：余额插件 / 小票 / 更新频道 / 已提示版本） ----------
+// ---------- 桌面设置（settings.json：余额插件 / 小票 / 更新频道 / 已提示版本 / llama 启动器） ----------
 const SETTINGS_FILE = () => path.join(app.getPath("userData"), "settings.json");
+/** llama.cpp 启动器默认配置（llama-server.exe 本地模型服务，OpenAI 兼容接口）。 */
+const DEFAULT_LLAMA_SETTINGS = {
+  dir: "E:\\AI_llama\\llama-b10649-bin-win-cuda-13.3-x64", // llama.cpp 目录（需含 llama-server.exe）
+  modelPath: "",     // 选中的 GGUF 主模型（绝对路径，空=未选择）
+  mmprojPath: "",    // 视觉模型 mmproj（GGUF，空=不启用视觉能力）
+  autoStart: false,  // 跟随软件启动（软件启动时自动拉起 llama-server）
+  host: "127.0.0.1", // 监听地址
+  port: 8080,        // 监听端口
+  ctxSize: 4096,     // 上下文长度 -c
+  gpuLayers: 999,    // GPU 卸载层数 -ngl（999=全部层，0=纯 CPU 不传该参数）
+  threads: 0,        // 生成线程数 -t（0=自动，不传该参数）
+  parallel: 1,       // 并行会话槽 -np
+  apiKey: "",        // API Key（留空=不校验）
+  extraArgs: "",     // 附加命令行参数（空格分隔，支持双引号包裹）
+};
 const DEFAULT_SETTINGS = {
   balancePlugin: true,    // 余额插件开关（默认打开）
   receiptEnabled: true,   // 小票功能开关（默认打开）
   updateChannel: "latest",// 版本列表频道：latest / next（默认 Latest）
   notifiedVersion: null,  // 已提示过的新版本号（每次新版本只提示一次）
+  llama: { ...DEFAULT_LLAMA_SETTINGS }, // llama.cpp 启动器
 };
+/** 清洗/规范化 llama 配置（来自 settings.json 或渲染层补丁）。 */
+function sanitizeLlamaSettings(raw) {
+  const out = { ...DEFAULT_LLAMA_SETTINGS };
+  if (!raw || typeof raw !== "object") return out;
+  if (typeof raw.dir === "string") out.dir = raw.dir.trim();
+  if (typeof raw.modelPath === "string") out.modelPath = raw.modelPath.trim();
+  if (typeof raw.mmprojPath === "string") out.mmprojPath = raw.mmprojPath.trim();
+  if (typeof raw.host === "string" && raw.host.trim() !== "") out.host = raw.host.trim();
+  const clampInt = (value, min, max, fallback) => {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.min(max, Math.max(min, Math.floor(n)));
+  };
+  out.port = clampInt(raw.port, 1, 65535, DEFAULT_LLAMA_SETTINGS.port);
+  out.ctxSize = clampInt(raw.ctxSize, 0, 10_000_000, DEFAULT_LLAMA_SETTINGS.ctxSize);
+  out.gpuLayers = clampInt(raw.gpuLayers, 0, 999, DEFAULT_LLAMA_SETTINGS.gpuLayers);
+  out.threads = clampInt(raw.threads, 0, 256, 0);
+  out.parallel = clampInt(raw.parallel, 1, 256, 1);
+  if (typeof raw.apiKey === "string") out.apiKey = raw.apiKey;
+  if (typeof raw.extraArgs === "string") out.extraArgs = raw.extraArgs;
+  if (typeof raw.autoStart === "boolean") out.autoStart = raw.autoStart;
+  return out;
+}
 let appSettings = { ...DEFAULT_SETTINGS };
 function loadAppSettings() {
   try {
@@ -377,6 +416,7 @@ function loadAppSettings() {
         ...(typeof parsed.receiptEnabled === "boolean" ? { receiptEnabled: parsed.receiptEnabled } : {}),
         ...(parsed.updateChannel === "latest" || parsed.updateChannel === "next" ? { updateChannel: parsed.updateChannel } : {}),
         ...(typeof parsed.notifiedVersion === "string" && parsed.notifiedVersion.trim() !== "" ? { notifiedVersion: parsed.notifiedVersion } : {}),
+        ...(parsed.llama !== undefined ? { llama: sanitizeLlamaSettings(parsed.llama) } : {}),
       };
     }
   } catch { /* 首次运行 */ }
@@ -392,6 +432,263 @@ function broadcastSettings() {
     try {
       if (!w.isDestroyed()) w.webContents.send("dsh:settings-changed", appSettings);
     } catch { /* ignore */ }
+  }
+}
+
+// ---------- llama.cpp 启动器（llama-server.exe：本地模型 OpenAI 兼容服务） ----------
+const LLAMA_LOG = () => path.join(logsDir(), "llama.log");
+/** llama-server 运行状态：stopped / starting / running / error。 */
+let llamaChild = null;
+let llamaStatus = {
+  state: "stopped",
+  pid: null,
+  port: null,
+  endpoint: null,
+  model: null,
+  startedAt: null,
+  error: null,
+  lastLog: null,
+};
+
+function llamaLog(line) {
+  try {
+    fs.mkdirSync(logsDir(), { recursive: true });
+    fs.appendFileSync(LLAMA_LOG(), `${new Date().toISOString()} ${line}\n`);
+  } catch { /* ignore */ }
+}
+
+/** llama-server.exe 路径（目录未配置时返回 null）。 */
+function llamaServerExePath() {
+  const cfg = appSettings.llama;
+  if (!cfg || typeof cfg.dir !== "string" || cfg.dir.trim() === "") return null;
+  return path.join(cfg.dir.trim(), "llama-server.exe");
+}
+
+/** 扫描 llama.cpp 目录（models/ 子目录与根目录）下的 GGUF 模型。 */
+function listLlamaModels() {
+  const cfg = appSettings.llama;
+  const out = [];
+  const seen = new Set();
+  if (!cfg || typeof cfg.dir !== "string" || cfg.dir.trim() === "") return out;
+  for (const root of [path.join(cfg.dir, "models"), cfg.dir]) {
+    let entries;
+    try {
+      entries = fs.readdirSync(root, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.isFile() || !/\.gguf$/i.test(entry.name)) continue;
+      const full = path.join(root, entry.name);
+      const key = path.resolve(full).toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      let sizeMB = 0;
+      let mtime = null;
+      try {
+        const stat = fs.statSync(full);
+        sizeMB = Math.round((stat.size / 1048576) * 10) / 10;
+        mtime = stat.mtimeMs;
+      } catch { /* ignore */ }
+      out.push({ name: entry.name, path: full, sizeMB, mtime });
+    }
+  }
+  out.sort((a, b) => a.name.localeCompare(b.name));
+  return out;
+}
+
+function llamaPublicStatus() {
+  return { ...llamaStatus };
+}
+
+function broadcastLlamaStatus() {
+  for (const w of BrowserWindow.getAllWindows()) {
+    try {
+      if (!w.isDestroyed()) w.webContents.send("dsh:llama-status-changed", llamaPublicStatus());
+    } catch { /* ignore */ }
+  }
+}
+
+/** 依据配置构造 llama-server 命令行参数。 */
+function llamaBuildArgs(cfg) {
+  const args = ["-m", cfg.modelPath, "--host", cfg.host, "--port", String(cfg.port)];
+  if (typeof cfg.mmprojPath === "string" && cfg.mmprojPath.trim() !== "") {
+    args.push("--mmproj", cfg.mmprojPath.trim());
+  }
+  if (cfg.ctxSize > 0) args.push("-c", String(cfg.ctxSize));
+  if (cfg.gpuLayers > 0) args.push("-ngl", String(cfg.gpuLayers));
+  if (cfg.threads > 0) args.push("-t", String(cfg.threads));
+  if (cfg.parallel > 1) args.push("-np", String(cfg.parallel));
+  if (typeof cfg.apiKey === "string" && cfg.apiKey.trim() !== "") args.push("--api-key", cfg.apiKey.trim());
+  if (typeof cfg.extraArgs === "string" && cfg.extraArgs.trim() !== "") {
+    // 附加参数按空格拆分，双引号包裹的整体作为一个参数
+    for (const piece of cfg.extraArgs.match(/"([^"]*)"|\S+/g) || []) {
+      const clean = piece.replace(/^"|"$/g, "");
+      if (clean !== "") args.push(clean);
+    }
+  }
+  return args;
+}
+
+/** 启动 llama-server：spawn 子进程 + 轮询 /health 直到就绪（大模型加载可能耗时数分钟）。
+ * onProgress(percent, stage)：可选进度回调，把真实阶段写入启动页进度条。 */
+async function startLlamaServer(onProgress = null) {
+  const cfg = appSettings.llama;
+  if (llamaStatus.state === "running") return { ok: false, error: "llama-server 已在运行" };
+  if (llamaStatus.state === "starting") return { ok: false, error: "llama-server 正在启动，请稍候" };
+  if (!cfg) return { ok: false, error: "llama 配置未初始化" };
+
+  const fail = (error) => {
+    llamaStatus = { ...llamaStatus, state: "error", error };
+    llamaLog(`start failed: ${error}`);
+    broadcastLlamaStatus();
+    return { ok: false, error };
+  };
+
+  const exe = llamaServerExePath();
+  if (!exe || !fs.existsSync(exe)) {
+    return fail(`未找到 llama-server.exe，请检查 llama.cpp 目录（当前：${cfg.dir || "未设置"}）`);
+  }
+  if (!cfg.modelPath || !fs.existsSync(cfg.modelPath)) {
+    return fail("请先选择 GGUF 模型文件");
+  }
+  if (!(await isPortFree(cfg.port))) {
+    return fail(`端口 ${cfg.port} 已被占用（可能 llama-server 已在运行）`);
+  }
+
+  const args = llamaBuildArgs(cfg);
+  llamaLog(`start: "${exe}" ${args.join(" ")}`);
+  if (onProgress) onProgress(10, "正在启动 llama 本地模型服务…");
+  const child = spawn(exe, args, {
+    cwd: cfg.dir,
+    env: process.env,
+    windowsHide: true,
+    stdio: ["ignore", "pipe", "pipe"],
+    shell: false,
+  });
+  llamaChild = child;
+  llamaStatus = {
+    state: "starting",
+    pid: child.pid ?? null,
+    port: cfg.port,
+    endpoint: `http://${cfg.host}:${cfg.port}`,
+    model: cfg.modelPath,
+    startedAt: Date.now(),
+    error: null,
+    lastLog: null,
+  };
+  broadcastLlamaStatus();
+
+  const receive = (chunk) => {
+    for (const rawLine of chunk.toString().split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (line === "") continue;
+      llamaLog(line);
+      llamaStatus.lastLog = line.slice(0, 300);
+    }
+  };
+  child.stdout.on("data", receive);
+  child.stderr.on("data", receive);
+  child.on("exit", (code, signal) => {
+    llamaLog(`llama-server exited code=${code} signal=${signal}`);
+    if (llamaChild !== child) return; // 已被 stopLlamaServer 接管
+    llamaChild = null;
+    const abnormal = code !== 0 && code !== null;
+    llamaStatus = {
+      state: abnormal ? "error" : "stopped",
+      pid: null,
+      port: null,
+      endpoint: null,
+      model: null,
+      startedAt: null,
+      error: abnormal
+        ? `llama-server 已退出（代码 ${code ?? signal ?? "unknown"}）${llamaStatus.lastLog ? `：${llamaStatus.lastLog}` : ""}`
+        : llamaStatus.error,
+      lastLog: llamaStatus.lastLog,
+    };
+    broadcastLlamaStatus();
+  });
+
+  // 轮询就绪：/health 返回 200（加载中为 503）；个别构建无 /health 时回退探测 /。
+  // 大模型（如 27B IQ3_S，约 11GB）加载可能耗时数分钟，超时上限 15 分钟。
+  // 进度按已等待时间缓慢推进（封顶 70%），就绪后 75%，随后交由 harness 启动流程接管进度条。
+  const loadStart = Date.now();
+  const deadline = loadStart + 15 * 60_000;
+  while (Date.now() < deadline && llamaChild === child && child.exitCode === null) {
+    if (await probeHttp(cfg.port, "/health") || await probeHttp(cfg.port, "/")) {
+      llamaStatus = { ...llamaStatus, state: "running" };
+      llamaLog(`llama-server ready at ${llamaStatus.endpoint}`);
+      if (onProgress) onProgress(75, "llama 模型服务已就绪");
+      broadcastLlamaStatus();
+      return { ok: true };
+    }
+    if (onProgress) {
+      const elapsedSec = Math.floor((Date.now() - loadStart) / 1000);
+      const percent = Math.min(70, 15 + Math.floor(elapsedSec / 3));
+      onProgress(percent, `正在加载本地模型…（${elapsedSec}s）`);
+    }
+    await delay(POLL_INTERVAL_MS * 2);
+  }
+
+  if (llamaChild === child && child.exitCode === null) {
+    // 启动超时：结束进程树并报错
+    stopLlamaServer();
+    llamaStatus = { ...llamaStatus, state: "error", error: "llama-server 启动超时（15 分钟），请检查日志" };
+    broadcastLlamaStatus();
+    return { ok: false, error: llamaStatus.error };
+  }
+  // 进程在等待期间退出，exit 回调已更新状态
+  return { ok: false, error: llamaStatus.error || "llama-server 启动失败" };
+}
+
+/** 停止 llama-server（连同子进程树）。 */
+function stopLlamaServer() {
+  const child = llamaChild;
+  llamaChild = null;
+  if (child) {
+    const pid = child.pid;
+    try { child.kill(); } catch { /* ignore */ }
+    try {
+      if (pid) execFile("taskkill", ["/pid", String(pid), "/t", "/f"], { windowsHide: true }, () => {});
+    } catch { /* ignore */ }
+    llamaLog(`llama-server stopped (pid=${pid})`);
+  }
+  llamaStatus = {
+    state: "stopped",
+    pid: null,
+    port: null,
+    endpoint: null,
+    model: null,
+    startedAt: null,
+    error: null,
+    lastLog: llamaStatus.lastLog,
+  };
+  broadcastLlamaStatus();
+  return { ok: true };
+}
+
+/** llama 跟随软件启动：在拉起 harness 服务之前先启动 llama-server，真实进度写入启动页进度条。
+ *  失败不阻塞 harness 启动（仅记录日志）。 */
+async function maybeStartLlamaBeforeHarness(win) {
+  const cfg = appSettings.llama;
+  if (!cfg || !cfg.autoStart || !cfg.modelPath) return;
+  if (llamaStatus.state === "running" || llamaStatus.state === "starting") return;
+  const exe = llamaServerExePath();
+  if (!exe || !fs.existsSync(exe)) {
+    log("llama auto-start skipped: llama-server.exe not found");
+    return;
+  }
+  log("llama auto-start before harness boot");
+  const onProgress = (percent, stage) => {
+    try {
+      if (win && !win.isDestroyed()) sendBoot(win, { page: "booting", stage, percent });
+    } catch { /* ignore */ }
+  };
+  try {
+    const result = await startLlamaServer(onProgress);
+    if (!result.ok) log(`llama auto-start failed: ${result.error}`);
+  } catch (err) {
+    log(`llama auto-start error: ${err && err.message ? err.message : String(err)}`);
   }
 }
 
@@ -1199,7 +1496,8 @@ async function installAndBoot(win, mode) {
   setRuntimeMode(mode);
   const ok = await ensureRuntime(win);
   if (!ok) return false;
-  await bootServer(win);
+  // 首次安装流程：跳过 llama 跟随启动阶段（安装页处于 installing 视图，避免页面切换冲突）
+  await bootServer(win, { skipLlama: true });
   return true;
 }
 
@@ -2140,9 +2438,66 @@ function registerIpc() {
     }
     if (patch.updateChannel === "latest" || patch.updateChannel === "next") next.updateChannel = patch.updateChannel;
     if (typeof patch.notifiedVersion === "string") next.notifiedVersion = patch.notifiedVersion;
+    if (patch.llama && typeof patch.llama === "object") next.llama = sanitizeLlamaSettings(patch.llama);
     appSettings = next;
     saveAppSettings();
     broadcastSettings();
+  });
+  // llama.cpp 启动器：读取配置/模型列表/状态
+  ipcMain.handle("dsh:llama-get", () => {
+    const exe = llamaServerExePath();
+    return {
+      config: appSettings.llama,
+      status: llamaPublicStatus(),
+      models: listLlamaModels(),
+      serverExe: !!exe && fs.existsSync(exe),
+    };
+  });
+  // llama.cpp 启动器：保存配置补丁（目录/模型/参数/跟随启动）
+  ipcMain.on("dsh:llama-save", (event, patch) => {
+    if (!patch || typeof patch !== "object") return;
+    appSettings.llama = sanitizeLlamaSettings({ ...appSettings.llama, ...patch });
+    saveAppSettings();
+    broadcastSettings();
+  });
+  ipcMain.handle("dsh:llama-browse-dir", async (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (!win) return null;
+    const result = await dialog.showOpenDialog(win, {
+      title: "选择 llama.cpp 目录（需包含 llama-server.exe）",
+      buttonLabel: "选择此文件夹",
+      defaultPath: (appSettings.llama && appSettings.llama.dir) || undefined,
+      properties: ["openDirectory"],
+    });
+    if (result.canceled || result.filePaths.length === 0) return null;
+    return result.filePaths[0];
+  });
+  ipcMain.handle("dsh:llama-browse-model", async (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (!win) return null;
+    const cfg = appSettings.llama || {};
+    const defaultPath = cfg.modelPath
+      || (cfg.dir ? path.join(cfg.dir, "models") : undefined);
+    const result = await dialog.showOpenDialog(win, {
+      title: "选择 GGUF 模型文件",
+      buttonLabel: "选择此文件",
+      defaultPath,
+      filters: [{ name: "GGUF 模型", extensions: ["gguf"] }],
+      properties: ["openFile"],
+    });
+    if (result.canceled || result.filePaths.length === 0) return null;
+    return result.filePaths[0];
+  });
+  ipcMain.on("dsh:llama-start", () => {
+    startLlamaServer().catch((err) => {
+      const message = err && err.message ? err.message : String(err);
+      log(`llama start failed: ${message}`);
+      llamaStatus = { ...llamaStatus, state: "error", error: message };
+      broadcastLlamaStatus();
+    });
+  });
+  ipcMain.on("dsh:llama-stop", () => {
+    stopLlamaServer();
   });
   ipcMain.handle("dsh:list-versions", () => listDshVersions());
   ipcMain.on("dsh:install-version", (event, version) => {
@@ -2429,11 +2784,11 @@ app.whenReady().then(async () => {
       ensureDshCliOnPath().catch((err) => log(`ensure dsh cli at startup failed: ${err.message}`));
       sendBoot(win, {
         page: "booting",
-        stage: runtimeMode === "global" || runtimeMode === "native"
-          ? "正在启动 DeepSeek Harness 服务…"
-          : "正在启动…",
-        percent: 90,
+        stage: "正在准备启动…",
+        percent: 8,
       });
+      // 说明：若开启 llama 跟随启动，进度条后续由 bootServer 内的 llama 阶段（10–75）
+      // 与 harness 阶段（78–100）接管，避免出现进度倒退。
       await bootServer(win);
       return;
     }
@@ -2457,9 +2812,12 @@ app.whenReady().then(async () => {
   });
 });
 
-/** 起服务并把窗口导航到主界面（含更新静默检查）。 */
+/** 起服务并把窗口导航到主界面（含更新静默检查）。
+ *  options.skipLlama：首次安装等场景跳过 llama 跟随启动阶段（避免干扰安装视图）。 */
 async function bootServer(win, options = {}) {
   log(`dsh version: ${bundledDshVersion()}`);
+  // llama 跟随软件启动：先于 harness 服务拉起 llama-server，真实进度写入启动页进度条
+  if (!options.skipLlama) await maybeStartLlamaBeforeHarness(win);
   const port = await startServer(win, options);
   if (port === null) return;
   if (options.readyBeforeLoad) {
@@ -2497,12 +2855,14 @@ async function bootServer(win, options = {}) {
 app.on("window-all-closed", () => {
   quitting = true;
   killServerTree();
+  stopLlamaServer();
   app.quit();
 });
 
 app.on("before-quit", () => {
   quitting = true;
   killServerTree();
+  stopLlamaServer();
 });
 
 process.on("uncaughtException", (err) => {

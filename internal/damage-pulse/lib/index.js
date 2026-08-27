@@ -41,6 +41,8 @@ function pendingDeduction(storage) {
 /** 2026-08-17 起生效的峰谷价格（单位：元 / 百万 tokens）。 */
 const PRICE_TABLE = {
 	version: "2026-08-17",
+	// 执行峰谷计费的星期：1=周一 … 7=周日（DeepSeek 周六日取消峰谷，默认周一至周五）
+	weekdays: [1, 2, 3, 4, 5],
 	peakHours: [[9, 12], [14, 18]],
 	models: {
 		"deepseek-v4-flash": {
@@ -84,9 +86,14 @@ function normalizePriceTable(candidate) {
 	const base = cloneJson(PRICE_TABLE);
 	const source = candidate && typeof candidate === "object" ? candidate : {};
 	base.version = typeof source.version === "string" && source.version.trim() !== "" ? source.version.trim() : PRICE_TABLE.version;
+	// weekdays：显式提供时覆盖（空数组=全部日期不执行峰谷，始终按谷价）
+	if (Array.isArray(source.weekdays)) {
+		base.weekdays = [...new Set(source.weekdays.filter((day) => Number.isInteger(day) && day >= 1 && day <= 7))].sort((a, b) => a - b);
+	}
 	if (Array.isArray(source.peakHours)) {
+		// 显式提供时覆盖（空数组=不设置峰谷时段，始终按谷价）
 		const peakHours = source.peakHours.filter((item) => Array.isArray(item) && item.length === 2 && Number.isFinite(Number(item[0])) && Number.isFinite(Number(item[1]))).map(([start, end]) => [Number(start), Number(end)]);
-		if (peakHours.length > 0) base.peakHours = peakHours;
+		base.peakHours = peakHours;
 	}
 	for (const model of Object.keys(PRICE_TABLE.models)) {
 		const candidateModel = source.models?.[model];
@@ -172,8 +179,23 @@ function beijingHour(ts) {
 	}).formatToParts(new Date(ts)).find((p) => p.type === "hour")?.value;
 	return hour === void 0 ? -1 : Number(hour);
 }
-/** 判断时间戳是否落在高峰时段（半开区间 [start, end)）。 */
-function isPeakHour(ts, peakHours) {
+/** 取时间戳对应的北京时间星期（1=周一 … 7=周日）；解析失败返回 -1。 */
+function beijingWeekday(ts) {
+	const text = new Intl.DateTimeFormat("en-GB", {
+		timeZone: "Asia/Shanghai",
+		weekday: "short"
+	}).format(new Date(ts));
+	const map = { Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6, Sun: 7 };
+	const day = map[text];
+	return day === void 0 ? -1 : day;
+}
+/** 判断时间戳是否落在高峰时段（半开区间 [start, end)），且当天为峰谷计费日。 */
+function isPeakHour(ts, peakHours, weekdays) {
+	if (Array.isArray(weekdays)) {
+		const day = beijingWeekday(ts);
+		// weekdays 为空数组=全部日期不执行峰谷；当天不在激活列表内同样不执行
+		if (weekdays.length === 0 || day === -1 || !weekdays.includes(day)) return false;
+	}
 	const hour = beijingHour(ts);
 	return peakHours.some(([start, end]) => hour >= start && hour < end);
 }
@@ -193,7 +215,7 @@ function resolveModelPrice(model, table) {
 function priceUsage(inputTokens, cacheReadTokens, cacheWriteTokens, outputTokens, model, ts, table = PRICE_TABLE) {
 	const active = selectPriceTable(ts, table);
 	const resolved = resolveModelPrice(model, active);
-	const peak = isPeakHour(ts, active.peakHours);
+	const peak = isPeakHour(ts, active.peakHours, active.weekdays);
 	const rate = peak ? resolved?.peak ?? FALLBACK : resolved?.offPeak ?? FALLBACK;
 	const costInput = inputTokens / 1e6 * rate.input;
 	const costCacheRead = cacheReadTokens / 1e6 * rate.cacheHit;
