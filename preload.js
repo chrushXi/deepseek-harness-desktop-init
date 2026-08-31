@@ -8,7 +8,7 @@
  * 仅在其顶部为窗体标头预留 44px 高度。
  *
  * 软件设置弹窗（设置按钮打开）：
- *   - Harness版本：Latest / Next 频道滑块 + 全部版本列表（按版本号安装），静默监控 Next，
+ *   - Harness版本：Latest / Next / Alpha 频道滑块 + 全部版本列表（按版本号安装），更新检查覆盖全部频道，
  *     每个新版本只通过该弹窗提示一次（设置按钮红点）；
  *   - 通用：余额插件开关 / 余额插件设置（峰谷计费，表单始终可见）/ 会话小票开关。
  *
@@ -680,6 +680,7 @@ let appSettings = { balancePlugin: true, receiptEnabled: true, updateChannel: "l
 let settingsDotEl = null;
 /** 待提示的新版本信息（每个版本只提示一次）。 */
 let updateNoticeInfo = null;
+let updateNoticeUnread = false;
 /** 设置弹窗元素与状态。 */
 let settingsDialogEl = null;
 let settingsPanelName = "versions";
@@ -688,6 +689,7 @@ let installingVersion = null;
 let pricingControls = null;
 /** 版本安装模式：当前正在安装的版本号（启动页安装视图使用）。 */
 let pendingInstallVersionLocal = null;
+let pendingInstallChannelLocal = null;
 
 let priceTable = null;
 const DEFAULT_PRICE_TABLE = {
@@ -709,6 +711,7 @@ const DEFAULT_PRICE_TABLE = {
 const clonePriceTable = (table) => JSON.parse(JSON.stringify(table));
 
 const escHtml = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+const escAttr = (s) => escHtml(s).replace(/"/g, "&quot;");
 
 /** 简易 semver 比较（与主进程回退实现一致）。 */
 function compareVersionsPreload(a, b) {
@@ -749,9 +752,14 @@ function applySettings(s) {
 /** 设置按钮新版本红点。 */
 function updateSettingsDot() {
   if (!settingsDotEl) return;
-  settingsDotEl.hidden = !updateNoticeInfo;
+  settingsDotEl.hidden = !updateNoticeUnread;
   const btn = settingsDotEl.closest(".dsh-tb-settings");
-  if (btn) btn.title = updateNoticeInfo ? `发现新版本 v${updateNoticeInfo.latest}，点击查看` : "软件设置";
+  if (btn) {
+    const channel = updateNoticeInfo && updateNoticeInfo.channel ? `（${updateNoticeInfo.channel}）` : "";
+    btn.title = updateNoticeUnread && updateNoticeInfo
+      ? `发现${channel}新版本 v${updateNoticeInfo.latest}，点击查看`
+      : "软件设置";
+  }
 }
 
 // ---------- 计费设置（峰谷价格表，迁移至设置弹窗的"余额插件设置"下拉内） ----------
@@ -1028,6 +1036,7 @@ const SETTINGS_DIALOG_CSS = `
 .dsh-set-card {
   width: 660px; max-width: calc(100vw - 40px);
   height: 620px; max-height: calc(100vh - 60px);
+  position: relative;
   display: flex; flex-direction: column;
   border-radius: 16px; overflow: hidden;
   background: var(--dsw-alias-bg-module-platform, #171b24);
@@ -1095,18 +1104,20 @@ const SETTINGS_DIALOG_CSS = `
 }
 .dsh-set-seg-pill {
   position: absolute; top: 3px; bottom: 3px; left: 3px;
-  width: calc(50% - 3px);
+  width: calc(33.333% - 3px);
   border-radius: 7px;
   background: var(--dsh-set-accent);
   box-shadow: 0 2px 6px rgba(77,107,254,.35);
   transition: transform .22s cubic-bezier(.2,.7,.3,1);
 }
 .dsh-set-seg[data-channel="next"] .dsh-set-seg-pill { transform: translateX(100%); }
+.dsh-set-seg[data-channel="alpha"] .dsh-set-seg-pill { transform: translateX(200%); }
 .dsh-set-seg-btn {
   -webkit-app-region: no-drag;
   appearance: none; border: none; cursor: pointer;
   position: relative; z-index: 1;
   padding: 5px 18px; border-radius: 7px;
+  min-width: 64px; text-align: center;
   font: inherit; font-size: 12px; font-weight: 400;
   letter-spacing: .05em;
   color: var(--dsw-alias-label-secondary, #aeb3bd);
@@ -1114,6 +1125,40 @@ const SETTINGS_DIALOG_CSS = `
   transition: color .16s ease;
 }
 .dsh-set-seg-btn.dsh-set-seg-on { color: #fff; }
+.dsh-confirm-backdrop {
+  position: absolute; inset: 0; z-index: 5;
+  display: none; align-items: center; justify-content: center;
+  padding: 18px;
+  background: rgba(8, 10, 16, .42);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+}
+.dsh-confirm-backdrop.dsh-confirm-open { display: flex; }
+.dsh-confirm-card {
+  width: 320px; max-width: 100%;
+  padding: 16px;
+  border: 1px solid var(--dsw-alias-border-l2, rgba(128,128,128,.28));
+  border-radius: 14px;
+  background: var(--dsw-alias-bg-module-platform, #171b24);
+  box-shadow: 0 18px 44px rgba(0,0,0,.38);
+  color: var(--dsw-alias-label-primary, #e8eaf0);
+  animation: dsh-set-in .18s cubic-bezier(.2,.7,.3,1) both;
+}
+.dsh-confirm-title { font-size: 14px; font-weight: 500; letter-spacing: .03em; }
+.dsh-confirm-message { margin-top: 9px; font-size: 12px; line-height: 1.55; color: var(--dsw-alias-label-secondary, #b4b9c2); word-break: break-word; }
+.dsh-confirm-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+.dsh-confirm-danger {
+  -webkit-app-region: no-drag;
+  appearance: none; cursor: pointer;
+  height: 30px; padding: 0 14px;
+  border: none; border-radius: 8px;
+  background: #dc2626; color: #fff;
+  font: inherit; font-size: 12px; font-weight: 500;
+  box-shadow: 0 4px 12px rgba(220,38,38,.34);
+  transition: filter .14s ease, transform .06s ease;
+}
+.dsh-confirm-danger:hover { filter: brightness(1.08); }
+.dsh-confirm-danger:active { transform: scale(.97); }
 .dsh-set-seg-btn:focus { outline: none; }
 .dsh-set-seg-btn:focus-visible { outline: none; }
 /* 版本列表 */
@@ -1296,7 +1341,7 @@ const SETTINGS_DIALOG_CSS = `
 #dsh-settings-dialog .dsh-tb-price-grid > span:nth-child(2) { color: #16a34a; font-weight: 400; }
 #dsh-settings-dialog .dsh-tb-price-grid > span:nth-child(3) { color: #d97706; font-weight: 400; }
 #dsh-settings-dialog .dsh-tb-price-input {
-  width: 100%; height: 26px; padding: 0 8px;
+  box-sizing: border-box; width: 100%; height: 26px; padding: 0 8px;
   border: 1px solid #d9dfeb;
   border-radius: 8px;
   background: #f7f9fc;
@@ -1457,8 +1502,67 @@ const SETTINGS_DIALOG_CSS = `
 .dsh-llama-select-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
 .dsh-llama-select-row:first-of-type { margin-top: 9px; }
 .dsh-llama-select-row .dsh-llama-select { margin-top: 0; flex: 1; min-width: 0; }
+.dsh-llama-preset-head { width: 100%; min-width: 0; }
+.dsh-llama-preset-tools { display: flex; align-items: center; gap: 8px; margin-top: 10px; min-width: 0; }
+.dsh-llama-preset-select { position: relative; flex: 1; min-width: 0; }
+.dsh-llama-preset-trigger {
+  -webkit-app-region: no-drag;
+  appearance: none; cursor: pointer;
+  position: relative;
+  box-sizing: border-box; width: 100%; height: 34px; padding: 0 34px 0 11px;
+  border: 1px solid var(--dsw-alias-border-l2, rgba(128,128,128,.3));
+  border-radius: 10px;
+  background: var(--dsw-alias-bg-base, #171b24);
+  color: var(--dsw-alias-label-primary, #e8eaf0);
+  font: inherit; font-size: 12px; text-align: left;
+  display: flex; align-items: center; min-width: 0; overflow: hidden;
+  transition: border-color .14s ease, background .14s ease;
+}
+.dsh-llama-preset-trigger:hover,
+.dsh-llama-preset-trigger[aria-expanded="true"] { border-color: color-mix(in srgb, var(--dsh-set-accent) 55%, rgba(128,128,128,.3)); }
+.dsh-llama-preset-trigger::after {
+  content: ""; position: absolute; right: 12px; top: 50%;
+  width: 7px; height: 7px;
+  border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor;
+  transform: translateY(-65%) rotate(45deg);
+  opacity: .7;
+}
+.dsh-llama-preset-text { min-width: 0; flex: 1; overflow: hidden; white-space: nowrap; position: relative; }
+.dsh-llama-preset-text-inner { display: inline-block; min-width: 100%; white-space: nowrap; }
+.dsh-llama-preset-scrolling:hover .dsh-llama-preset-text-inner,
+.dsh-llama-preset-trigger.dsh-llama-preset-scrolling[aria-expanded="true"] .dsh-llama-preset-text-inner { animation: dsh-llama-marquee var(--dsh-llama-scroll-dur, 8s) linear infinite; }
+@keyframes dsh-llama-marquee {
+  0%, 14% { transform: translateX(0); }
+  86%, 100% { transform: translateX(var(--dsh-llama-scroll-x, 0px)); }
+}
+.dsh-llama-preset-menu {
+  position: absolute; z-index: 12; left: 0; right: 0; top: calc(100% + 6px);
+  box-sizing: border-box;
+  display: none; max-height: 190px; overflow-y: auto; overflow-x: hidden;
+  border: 1px solid var(--dsw-alias-border-l2, rgba(128,128,128,.28));
+  border-radius: 10px;
+  background: var(--dsw-alias-bg-module-platform, #171b24);
+  box-shadow: 0 12px 34px rgba(0,0,0,.28);
+}
+.dsh-llama-preset-select.dsh-llama-preset-open .dsh-llama-preset-menu { display: block; }
+.dsh-llama-preset-option {
+  -webkit-app-region: no-drag;
+  appearance: none; border: none; cursor: pointer;
+  box-sizing: border-box; width: 100%; height: 32px; padding: 0 11px;
+  background: transparent; color: var(--dsw-alias-label-secondary, #b4b9c2);
+  font: inherit; font-size: 12px; text-align: left;
+  display: flex; align-items: center; min-width: 0; overflow: hidden;
+}
+.dsh-llama-preset-option:hover,
+.dsh-llama-preset-option.dsh-llama-preset-option-on { background: var(--dsw-alias-interactive-bg-hover, rgba(255,255,255,.07)); color: var(--dsw-alias-label-primary, #e8eaf0); }
+.dsh-llama-preset-menu .dsh-llama-preset-option:hover .dsh-llama-preset-text-inner,
+.dsh-llama-preset-menu .dsh-llama-preset-option.dsh-llama-preset-option-on .dsh-llama-preset-text-inner { white-space: nowrap; }
+.dsh-llama-preset-body { margin-top: 8px; }
+.dsh-llama-form { margin-top: 10px; }
+.dsh-llama-path-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: end; }
+.dsh-llama-path-row + .dsh-llama-path-row { margin-top: 9px; }
 #dsh-settings-dialog .dsh-llama-param-grid {
-  display: grid; grid-template-columns: 1fr 1fr; gap: 9px 10px;
+  display: grid; grid-template-columns: 1fr 1fr; gap: 9px 10px; margin-top: 10px;
 }
 #dsh-settings-dialog .dsh-llama-field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 #dsh-settings-dialog .dsh-llama-field > span { font-size: 11px; letter-spacing: .03em; color: #5b6478; }
@@ -1500,25 +1604,59 @@ const PRICING_FORM_HTML = `
   </div>
 `;
 
-/** Llama 启动器：运行参数表单（白色纸面，与计费表单同风格）。 */
-const LLAMA_PARAMS_FORM_HTML = `
-  <div class="dsh-llama-param-grid">
-    <label class="dsh-llama-field"><span>监听端口</span><input class="dsh-tb-price-input" id="dsh-llama-port" inputmode="numeric" placeholder="8080"></label>
-    <label class="dsh-llama-field"><span>上下文长度 -c</span><input class="dsh-tb-price-input" id="dsh-llama-ctx" inputmode="numeric" placeholder="4096"></label>
-    <label class="dsh-llama-field"><span>GPU 层数 -ngl（0=纯 CPU）</span><input class="dsh-tb-price-input" id="dsh-llama-ngl" inputmode="numeric" placeholder="999"></label>
-    <label class="dsh-llama-field"><span>线程数 -t（0=自动）</span><input class="dsh-tb-price-input" id="dsh-llama-threads" inputmode="numeric" placeholder="0"></label>
-    <label class="dsh-llama-field"><span>并行会话 -np</span><input class="dsh-tb-price-input" id="dsh-llama-np" inputmode="numeric" placeholder="1"></label>
-    <label class="dsh-llama-field"><span>API Key（可选）</span><input class="dsh-tb-price-input" id="dsh-llama-apikey" placeholder="留空不校验"></label>
-    <label class="dsh-llama-field dsh-llama-field-wide"><span>附加参数（空格分隔，支持双引号）</span><input class="dsh-tb-price-input" id="dsh-llama-extra" placeholder="例如：--jinja --no-mmap"></label>
+/** Llama 启动器：启动预设表单（模型路径与运行参数保存在同一预设中）。 */
+const LLAMA_PRESET_FORM_HTML = `
+  <div class="dsh-llama-form">
+    <div class="dsh-llama-path-row">
+      <label class="dsh-llama-field"><span>预设名称</span><input class="dsh-tb-price-input" id="dsh-llama-preset-name" placeholder="例如：Qwen 32B"></label>
+      <span></span>
+    </div>
+    <div class="dsh-llama-path-row">
+      <label class="dsh-llama-field"><span>主模型路径（必选）</span><input class="dsh-tb-price-input dsh-llama-path-input" id="dsh-llama-model-path" placeholder="请选择 .gguf 主模型文件"></label>
+      <button class="dsh-set-btn dsh-set-btn-ghost dsh-set-btn-sm" id="dsh-llama-model-browse" type="button">浏览…</button>
+    </div>
+    <div class="dsh-llama-path-row">
+      <label class="dsh-llama-field"><span>视觉模型路径（可选）</span><input class="dsh-tb-price-input dsh-llama-path-input" id="dsh-llama-mmproj-path" placeholder="可选择 mmproj 模型文件"></label>
+      <span class="dsh-llama-actions">
+        <button class="dsh-set-btn dsh-set-btn-ghost dsh-set-btn-sm" id="dsh-llama-mmproj-browse" type="button">浏览…</button>
+        <button class="dsh-set-btn dsh-set-btn-ghost dsh-set-btn-sm" id="dsh-llama-mmproj-clear" type="button">清除</button>
+      </span>
+    </div>
+    <div class="dsh-llama-param-grid">
+      <label class="dsh-llama-field"><span>监听端口</span><input class="dsh-tb-price-input" id="dsh-llama-port" inputmode="numeric" placeholder="8080"></label>
+      <label class="dsh-llama-field"><span>上下文长度 -c</span><input class="dsh-tb-price-input" id="dsh-llama-ctx" inputmode="numeric" placeholder="4096"></label>
+      <label class="dsh-llama-field"><span>GPU 层数 -ngl（0=纯 CPU）</span><input class="dsh-tb-price-input" id="dsh-llama-ngl" inputmode="numeric" placeholder="999"></label>
+      <label class="dsh-llama-field"><span>线程数 -t（0=自动）</span><input class="dsh-tb-price-input" id="dsh-llama-threads" inputmode="numeric" placeholder="0"></label>
+      <label class="dsh-llama-field"><span>并行会话 -np</span><input class="dsh-tb-price-input" id="dsh-llama-np" inputmode="numeric" placeholder="1"></label>
+      <label class="dsh-llama-field"><span>API Key（可选）</span><input class="dsh-tb-price-input" id="dsh-llama-apikey" placeholder="留空不校验"></label>
+      <label class="dsh-llama-field dsh-llama-field-wide"><span>附加参数（空格分隔，支持双引号）</span><input class="dsh-tb-price-input" id="dsh-llama-extra" placeholder="例如：--jinja --no-mmap"></label>
+    </div>
   </div>
   <div class="dsh-tb-price-actions">
-    <span class="dsh-tb-price-status" id="dsh-llama-params-status"></span>
+    <span class="dsh-tb-price-status" id="dsh-llama-preset-status"></span>
     <span class="dsh-tb-price-buttons">
-      <button class="dsh-tb-price-btn" id="dsh-llama-params-reset" type="button">恢复默认</button>
-      <button class="dsh-tb-price-btn dsh-tb-price-btn-primary" id="dsh-llama-params-save" type="button">保存参数</button>
+      <button class="dsh-tb-price-btn" id="dsh-llama-preset-reset" type="button">恢复默认</button>
+      <button class="dsh-tb-price-btn dsh-tb-price-btn-primary" id="dsh-llama-preset-save" type="button">保存修改</button>
     </span>
   </div>
 `;
+
+function blankLlamaPreset(name = "新预设") {
+  return {
+    id: `preset-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+    name,
+    modelPath: "",
+    mmprojPath: "",
+    host: "127.0.0.1",
+    port: 8080,
+    ctxSize: 4096,
+    gpuLayers: 999,
+    threads: 0,
+    parallel: 1,
+    apiKey: "",
+    extraArgs: "",
+  };
+}
 
 function ensureSettingsDialog() {
   if (settingsDialogEl) return settingsDialogEl;
@@ -1555,6 +1693,7 @@ function ensureSettingsDialog() {
                 <span class="dsh-set-seg-pill"></span>
                 <button class="dsh-set-seg-btn dsh-set-seg-on" data-channel="latest" type="button">Latest</button>
                 <button class="dsh-set-seg-btn" data-channel="next" type="button">Next</button>
+                <button class="dsh-set-seg-btn" data-channel="alpha" type="button">Alpha</button>
               </div>
             </div>
             <div class="dsh-set-version-list" id="dsh-set-version-list"></div>
@@ -1605,7 +1744,7 @@ function ensureSettingsDialog() {
             <div class="dsh-set-section">
               <div class="dsh-set-row">
                 <div class="dsh-set-row-text">
-                  <div class="dsh-set-row-title">服务状态 <span class="dsh-llama-badge dsh-llama-badge-stopped" id="dsh-llama-badge">已停止</span></div>
+                  <div class="dsh-set-row-title">启动状态 <span class="dsh-llama-badge dsh-llama-badge-stopped" id="dsh-llama-badge">已停止</span></div>
                   <div class="dsh-set-row-sub" id="dsh-llama-state-detail">在软件内一键启动 llama-server，提供 OpenAI 兼容接口</div>
                 </div>
                 <span class="dsh-llama-actions">
@@ -1635,38 +1774,43 @@ function ensureSettingsDialog() {
               </div>
             </div>
             <div class="dsh-set-section">
-              <div class="dsh-set-row">
-                <div class="dsh-set-row-text" style="flex: 1; min-width: 0;">
-                  <div class="dsh-set-row-title dsh-llama-title-row">
-                    <span>模型</span>
-                    <button class="dsh-set-btn dsh-set-btn-ghost dsh-set-btn-sm dsh-llama-refresh" id="dsh-llama-model-refresh" type="button">刷新</button>
+              <div class="dsh-llama-preset-head">
+                <div class="dsh-set-row-title">启动预设</div>
+                <div class="dsh-set-row-sub">选择已有配置，或新增预设保存不同模型与启动参数</div>
+                <div class="dsh-llama-preset-tools">
+                  <div class="dsh-llama-preset-select" id="dsh-llama-preset-select">
+                    <button class="dsh-llama-preset-trigger" id="dsh-llama-preset-trigger" type="button" aria-haspopup="listbox" aria-expanded="false">
+                      <span class="dsh-llama-preset-text"><span class="dsh-llama-preset-text-inner" id="dsh-llama-preset-trigger-text">默认预设</span></span>
+                    </button>
+                    <div class="dsh-llama-preset-menu" id="dsh-llama-preset-menu" role="listbox"></div>
                   </div>
-                  <div class="dsh-set-row-sub">主模型与视觉模型（mmproj，可选）</div>
-                  <div class="dsh-llama-select-row">
-                    <select class="dsh-llama-select" id="dsh-llama-model"></select>
-                    <button class="dsh-set-btn dsh-set-btn-ghost dsh-set-btn-sm" id="dsh-llama-model-browse" type="button">浏览…</button>
-                  </div>
-                  <div class="dsh-llama-select-row">
-                    <select class="dsh-llama-select" id="dsh-llama-mmproj"></select>
-                    <button class="dsh-set-btn dsh-set-btn-ghost dsh-set-btn-sm" id="dsh-llama-mmproj-browse" type="button">浏览…</button>
-                  </div>
+                  <button class="dsh-set-btn dsh-set-btn-ghost dsh-set-btn-sm" id="dsh-llama-preset-add" type="button">新增</button>
+                  <button class="dsh-set-btn dsh-set-btn-ghost dsh-set-btn-sm" id="dsh-llama-preset-delete" type="button">删除</button>
                 </div>
-              </div>
-            </div>
-            <div class="dsh-set-section">
-              <div class="dsh-set-subsection" style="margin-top: 0;">
-                <button class="dsh-set-subsection-head" id="dsh-llama-params-toggle" type="button" aria-expanded="false">
-                  <span class="dsh-set-subsection-title">运行参数（高级）</span>
-                  <svg class="dsh-tb-action-caret" width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
-                    <path d="M3 1.5 L6.5 5 L3 8.5" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>
-                  </svg>
-                </button>
-                <div class="dsh-set-subsection-body" id="dsh-llama-params-body">
-                  <div class="dsh-set-subsection-inner">${LLAMA_PARAMS_FORM_HTML}</div>
+                <div class="dsh-set-subsection dsh-llama-preset-config" style="margin-top: 12px;">
+                  <button class="dsh-set-subsection-head" id="dsh-llama-preset-toggle" type="button" aria-expanded="false">
+                    <span class="dsh-set-subsection-title">预设参数</span>
+                    <svg class="dsh-tb-action-caret" width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
+                      <path d="M3 1.5 L6.5 5 L3 8.5" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                  </button>
+                  <div class="dsh-set-subsection-body" id="dsh-llama-preset-body">
+                    <div class="dsh-llama-preset-body">${LLAMA_PRESET_FORM_HTML}</div>
+                  </div>
                 </div>
               </div>
             </div>
           </section>
+        </div>
+      </div>
+      <div class="dsh-confirm-backdrop" id="dsh-llama-delete-confirm" role="dialog" aria-modal="true" aria-labelledby="dsh-llama-delete-confirm-title">
+        <div class="dsh-confirm-card">
+          <div class="dsh-confirm-title" id="dsh-llama-delete-confirm-title">删除启动预设</div>
+          <div class="dsh-confirm-message" id="dsh-llama-delete-confirm-message"></div>
+          <div class="dsh-confirm-actions">
+            <button class="dsh-set-btn dsh-set-btn-ghost dsh-set-btn-sm" id="dsh-llama-delete-cancel" type="button">取消</button>
+            <button class="dsh-confirm-danger" id="dsh-llama-delete-confirm-action" type="button">删除</button>
+          </div>
         </div>
       </div>
     </div>`;
@@ -1687,7 +1831,7 @@ function ensureSettingsDialog() {
     api.checkUpdate(false);
   });
   settingsDialogEl.querySelector("#dsh-set-notice-install").addEventListener("click", () => {
-    if (updateNoticeInfo) startInstallVersion(updateNoticeInfo.latest);
+    if (updateNoticeInfo) startInstallVersion(updateNoticeInfo.latest, updateNoticeInfo.channel);
   });
   const balancePluginInput = settingsDialogEl.querySelector("#dsh-set-balance-plugin");
   balancePluginInput.addEventListener("change", () => api.saveSettings({ balancePlugin: balancePluginInput.checked }));
@@ -1707,11 +1851,20 @@ function ensureSettingsDialog() {
   if (!pricingControls) {
     pricingControls = attachPricingForm(pricingInner);
   }
-  // Llama 启动器：跟随启动开关 / 启停按钮 / 目录与模型选择 / 参数表单
+  // Llama 启动器：跟随启动开关 / 启停按钮 / 目录与启动预设
   const llamaAutoInput = settingsDialogEl.querySelector("#dsh-llama-autostart");
   llamaAutoInput.addEventListener("change", () => api.llamaSave({ autoStart: llamaAutoInput.checked }));
   settingsDialogEl.querySelector("#dsh-llama-start").addEventListener("click", () => api.llamaStart());
   settingsDialogEl.querySelector("#dsh-llama-stop").addEventListener("click", () => api.llamaStop());
+  const llamaPresetToggle = settingsDialogEl.querySelector("#dsh-llama-preset-toggle");
+  const llamaPresetBody = settingsDialogEl.querySelector("#dsh-llama-preset-body");
+  llamaPresetToggle.addEventListener("click", () => {
+    const open = llamaPresetBody.classList.contains("dsh-set-subsection-open");
+    llamaPresetBody.classList.toggle("dsh-set-subsection-open", !open);
+    llamaPresetToggle.classList.toggle("dsh-set-subsection-on", !open);
+    llamaPresetToggle.setAttribute("aria-expanded", String(!open));
+    if (!open) requestAnimationFrame(refreshLlamaMarquees);
+  });
   settingsDialogEl.querySelector("#dsh-llama-browse-dir").addEventListener("click", async () => {
     const dir = await api.llamaBrowseDir();
     if (dir && typeof dir === "string") {
@@ -1719,53 +1872,131 @@ function ensureSettingsDialog() {
       setTimeout(refreshLlamaPanel, 250);
     }
   });
-  const llamaModelSelect = settingsDialogEl.querySelector("#dsh-llama-model");
-  llamaModelSelect.addEventListener("change", () => {
-    if (llamaModelSelect.value) api.llamaSave({ modelPath: llamaModelSelect.value });
+  const llamaPresetSelect = settingsDialogEl.querySelector("#dsh-llama-preset-select");
+  const llamaPresetTrigger = settingsDialogEl.querySelector("#dsh-llama-preset-trigger");
+  const llamaPresetMenu = settingsDialogEl.querySelector("#dsh-llama-preset-menu");
+  const llamaDeleteConfirm = settingsDialogEl.querySelector("#dsh-llama-delete-confirm");
+  const llamaDeleteMessage = settingsDialogEl.querySelector("#dsh-llama-delete-confirm-message");
+  const llamaDeleteCancel = settingsDialogEl.querySelector("#dsh-llama-delete-cancel");
+  const llamaDeleteAction = settingsDialogEl.querySelector("#dsh-llama-delete-confirm-action");
+  let llamaDeleteResolver = null;
+  const finishLlamaDeleteConfirm = (confirmed) => {
+    if (!llamaDeleteConfirm) return;
+    llamaDeleteConfirm.classList.remove("dsh-confirm-open");
+    const resolve = llamaDeleteResolver;
+    llamaDeleteResolver = null;
+    if (resolve) resolve(confirmed);
+  };
+  const requestLlamaDeleteConfirm = (name) => new Promise((resolve) => {
+    llamaDeleteResolver = resolve;
+    if (llamaDeleteMessage) llamaDeleteMessage.textContent = `确定删除预设“${name}”吗？删除后无法恢复。`;
+    if (llamaDeleteConfirm) llamaDeleteConfirm.classList.add("dsh-confirm-open");
+    if (llamaDeleteCancel) llamaDeleteCancel.focus();
   });
-  const llamaMmprojSelect = settingsDialogEl.querySelector("#dsh-llama-mmproj");
-  llamaMmprojSelect.addEventListener("change", () => {
-    api.llamaSave({ mmprojPath: llamaMmprojSelect.value || "" });
+  llamaDeleteCancel.addEventListener("click", () => finishLlamaDeleteConfirm(false));
+  llamaDeleteAction.addEventListener("click", () => finishLlamaDeleteConfirm(true));
+  llamaDeleteConfirm.addEventListener("pointerdown", (event) => {
+    if (event.target === llamaDeleteConfirm) finishLlamaDeleteConfirm(false);
   });
-  settingsDialogEl.querySelector("#dsh-llama-mmproj-browse").addEventListener("click", async () => {
-    const file = await api.llamaBrowseModel();
-    if (file && typeof file === "string") {
-      api.llamaSave({ mmprojPath: file });
-      setTimeout(refreshLlamaPanel, 250);
+  llamaDeleteConfirm.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      finishLlamaDeleteConfirm(false);
     }
   });
-  settingsDialogEl.querySelector("#dsh-llama-model-refresh").addEventListener("click", () => { refreshLlamaPanel(); });
-  settingsDialogEl.querySelector("#dsh-llama-model-browse").addEventListener("click", async () => {
-    const file = await api.llamaBrowseModel();
-    if (file && typeof file === "string") {
-      api.llamaSave({ modelPath: file });
-      setTimeout(refreshLlamaPanel, 250);
-    }
-  });
-  // 运行参数（高级）：可折叠
-  const llamaParamsToggle = settingsDialogEl.querySelector("#dsh-llama-params-toggle");
-  const llamaParamsBody = settingsDialogEl.querySelector("#dsh-llama-params-body");
-  llamaParamsToggle.addEventListener("click", () => {
-    const open = llamaParamsBody.classList.contains("dsh-set-subsection-open");
-    llamaParamsBody.classList.toggle("dsh-set-subsection-open", !open);
-    llamaParamsToggle.classList.toggle("dsh-set-subsection-on", !open);
-    llamaParamsToggle.setAttribute("aria-expanded", String(!open));
-  });
-  const llamaParamsStatus = (text, cls) => {
-    const el = settingsDialogEl.querySelector("#dsh-llama-params-status");
+  const setLlamaPresetStatus = (text, cls) => {
+    const el = settingsDialogEl.querySelector("#dsh-llama-preset-status");
     if (el) {
       el.textContent = text;
       el.className = "dsh-tb-price-status" + (cls ? " " + cls : "");
     }
   };
-  settingsDialogEl.querySelector("#dsh-llama-params-save").addEventListener("click", () => {
+  const closeLlamaPresetMenu = () => {
+    if (!llamaPresetSelect || !llamaPresetTrigger) return;
+    llamaPresetSelect.classList.remove("dsh-llama-preset-open");
+    llamaPresetTrigger.setAttribute("aria-expanded", "false");
+  };
+  const toggleLlamaPresetMenu = () => {
+    if (!llamaPresetSelect || !llamaPresetTrigger) return;
+    const open = llamaPresetSelect.classList.toggle("dsh-llama-preset-open");
+    llamaPresetTrigger.setAttribute("aria-expanded", String(open));
+    if (open) requestAnimationFrame(refreshLlamaMarquees);
+  };
+  llamaPresetTrigger.addEventListener("click", toggleLlamaPresetMenu);
+  llamaPresetMenu.addEventListener("click", (event) => {
+    const option = event.target.closest(".dsh-llama-preset-option");
+    if (!option) return;
+    const id = option.dataset.presetId;
+    if (!id) return;
+    closeLlamaPresetMenu();
+    api.llamaSave({ activePresetId: id });
+    setTimeout(refreshLlamaPanel, 180);
+  });
+  document.addEventListener("pointerdown", (event) => {
+    if (llamaPresetSelect && !llamaPresetSelect.contains(event.target)) closeLlamaPresetMenu();
+  });
+  settingsDialogEl.querySelector("#dsh-llama-preset-add").addEventListener("click", () => {
+    const cfg = (llamaData && llamaData.config) || appSettings.llama || {};
+    const presets = Array.isArray(cfg.presets) ? cfg.presets.map((preset) => ({ ...preset })) : [];
+    const preset = blankLlamaPreset(`新预设 ${presets.length + 1}`);
+    presets.push(preset);
+    api.llamaSave({ presets, activePresetId: preset.id });
+    setTimeout(refreshLlamaPanel, 180);
+  });
+  settingsDialogEl.querySelector("#dsh-llama-preset-delete").addEventListener("click", async () => {
+    const cfg = (llamaData && llamaData.config) || appSettings.llama || {};
+    const presets = Array.isArray(cfg.presets) ? cfg.presets.map((preset) => ({ ...preset })) : [];
+    if (presets.length <= 1) {
+      setLlamaPresetStatus("至少保留一个启动预设", "dsh-tb-price-status-err");
+      return;
+    }
+    const index = Math.max(0, presets.findIndex((preset) => preset.id === cfg.activePresetId));
+    const active = presets[index];
+    if (!active) return;
+    const confirmed = await requestLlamaDeleteConfirm(active.name || "未命名预设");
+    if (!confirmed) return;
+    const remaining = presets.filter((preset) => preset.id !== active.id);
+    const next = remaining[Math.min(index, remaining.length - 1)] || remaining[0];
+    api.llamaSave({ presets: remaining, activePresetId: next.id });
+    setTimeout(refreshLlamaPanel, 180);
+  });
+  settingsDialogEl.querySelector("#dsh-llama-model-browse").addEventListener("click", async () => {
+    const file = await api.llamaBrowseModel("model");
+    const input = settingsDialogEl.querySelector("#dsh-llama-model-path");
+    if (file && typeof file === "string" && input) {
+      input.value = file;
+      setLlamaPresetStatus("主模型已选择，请点击“保存修改”", "");
+    }
+  });
+  settingsDialogEl.querySelector("#dsh-llama-mmproj-browse").addEventListener("click", async () => {
+    const file = await api.llamaBrowseModel("mmproj");
+    const input = settingsDialogEl.querySelector("#dsh-llama-mmproj-path");
+    if (file && typeof file === "string" && input) {
+      input.value = file;
+      setLlamaPresetStatus("视觉模型已选择，请点击“保存修改”", "");
+    }
+  });
+  settingsDialogEl.querySelector("#dsh-llama-mmproj-clear").addEventListener("click", () => {
+    const input = settingsDialogEl.querySelector("#dsh-llama-mmproj-path");
+    if (input) input.value = "";
+    setLlamaPresetStatus("已清除视觉模型路径，请点击“保存修改”", "");
+  });
+  settingsDialogEl.querySelector("#dsh-llama-preset-save").addEventListener("click", () => {
     const num = (sel, fallback) => {
       const raw = String(settingsDialogEl.querySelector(sel).value || "").trim();
       if (raw === "") return fallback;
       const n = Number(raw);
       return Number.isFinite(n) ? Math.floor(n) : fallback;
     };
-    const patch = {
+    const cfg = (llamaData && llamaData.config) || appSettings.llama || {};
+    const presets = Array.isArray(cfg.presets) ? cfg.presets.map((preset) => ({ ...preset })) : [];
+    const active = presets.find((preset) => preset.id === cfg.activePresetId) || presets[0] || {
+      id: `preset-${Date.now().toString(36)}`, name: "默认预设",
+    };
+    const values = {
+      name: String(settingsDialogEl.querySelector("#dsh-llama-preset-name").value || "").trim() || "未命名预设",
+      modelPath: String(settingsDialogEl.querySelector("#dsh-llama-model-path").value || "").trim(),
+      mmprojPath: String(settingsDialogEl.querySelector("#dsh-llama-mmproj-path").value || "").trim(),
       port: num("#dsh-llama-port", 8080),
       ctxSize: num("#dsh-llama-ctx", 4096),
       gpuLayers: num("#dsh-llama-ngl", 999),
@@ -1774,17 +2005,38 @@ function ensureSettingsDialog() {
       apiKey: String(settingsDialogEl.querySelector("#dsh-llama-apikey").value || ""),
       extraArgs: String(settingsDialogEl.querySelector("#dsh-llama-extra").value || ""),
     };
-    if (patch.port < 1 || patch.port > 65535) {
-      llamaParamsStatus("端口需在 1–65535 之间", "dsh-tb-price-status-err");
+    if (values.port < 1 || values.port > 65535) {
+      setLlamaPresetStatus("端口需在 1–65535 之间", "dsh-tb-price-status-err");
       return;
     }
-    api.llamaSave(patch);
-    llamaParamsStatus("参数已保存（下次启动服务时生效）", "dsh-tb-price-status-ok");
+    const index = presets.findIndex((preset) => preset.id === active.id);
+    if (index >= 0) presets[index] = { ...presets[index], ...active, ...values };
+    else presets.push({ ...active, ...values });
+    api.llamaSave({ presets, activePresetId: active.id });
+    setLlamaPresetStatus("预设修改已保存（下次启动服务时生效）", "dsh-tb-price-status-ok");
+    setTimeout(refreshLlamaPanel, 180);
   });
-  settingsDialogEl.querySelector("#dsh-llama-params-reset").addEventListener("click", () => {
-    api.llamaSave({ port: 8080, ctxSize: 4096, gpuLayers: 999, threads: 0, parallel: 1, apiKey: "", extraArgs: "" });
-    llamaParamsStatus("已恢复默认参数", "dsh-tb-price-status-ok");
-    setTimeout(refreshLlamaPanel, 250);
+  settingsDialogEl.querySelector("#dsh-llama-preset-name").addEventListener("change", () => {
+    const cfg = (llamaData && llamaData.config) || appSettings.llama || {};
+    const presets = Array.isArray(cfg.presets) ? cfg.presets.map((preset) => ({ ...preset })) : [];
+    const active = presets.find((preset) => preset.id === cfg.activePresetId);
+    if (!active) return;
+    const name = String(settingsDialogEl.querySelector("#dsh-llama-preset-name").value || "").trim() || "未命名预设";
+    const index = presets.findIndex((preset) => preset.id === active.id);
+    presets[index] = { ...active, name };
+    api.llamaSave({ presets, activePresetId: active.id });
+    setTimeout(refreshLlamaPanel, 180);
+  });
+  settingsDialogEl.querySelector("#dsh-llama-preset-reset").addEventListener("click", () => {
+    const cfg = (llamaData && llamaData.config) || appSettings.llama || {};
+    const presets = Array.isArray(cfg.presets) ? cfg.presets.map((preset) => ({ ...preset })) : [];
+    const active = presets.find((preset) => preset.id === cfg.activePresetId) || presets[0];
+    if (!active) return;
+    const index = presets.findIndex((preset) => preset.id === active.id);
+    presets[index] = { ...active, port: 8080, ctxSize: 4096, gpuLayers: 999, threads: 0, parallel: 1, apiKey: "", extraArgs: "" };
+    api.llamaSave({ presets, activePresetId: active.id });
+    setLlamaPresetStatus("已恢复默认运行参数", "dsh-tb-price-status-ok");
+    setTimeout(refreshLlamaPanel, 180);
   });
   return settingsDialogEl;
 }
@@ -1803,7 +2055,7 @@ function selectSettingsPanel(panel) {
 }
 
 function setUpdateChannel(channel) {
-  if (channel !== "latest" && channel !== "next") return;
+  if (channel !== "latest" && channel !== "next" && channel !== "alpha") return;
   appSettings.updateChannel = channel;
   api.saveSettings({ updateChannel: channel });
   syncSettingsSwitches();
@@ -1813,6 +2065,9 @@ function setUpdateChannel(channel) {
 function openSettingsDialog() {
   const dlg = ensureSettingsDialog();
   dlg.classList.add("dsh-set-open");
+  // 打开设置页即视为已查看更新提示，清除标题栏红点，但保留详情展示。
+  updateNoticeUnread = false;
+  updateSettingsDot();
   selectSettingsPanel(settingsPanelName);
   renderNoticeBanner();
   // 每次打开都重新拉取计费价格表（保持与标题栏峰谷指示一致）
@@ -1856,9 +2111,26 @@ const LLAMA_STATE_TEXT = {
   error: ["错误", "dsh-llama-badge-error"],
 };
 
-function llamaModelLabel(model) {
-  const size = model.sizeMB >= 1024 ? `${(model.sizeMB / 1024).toFixed(1)} GB` : `${model.sizeMB} MB`;
-  return `${model.name}（${size}）`;
+function updateLlamaMarquee(textWrap) {
+  if (!textWrap) return;
+  const inner = textWrap.querySelector(".dsh-llama-preset-text-inner");
+  const target = textWrap.closest(".dsh-llama-preset-trigger, .dsh-llama-preset-option") || textWrap;
+  if (!inner) return;
+  const distance = Math.min(0, textWrap.clientWidth - inner.scrollWidth);
+  if (distance < 0) {
+    target.classList.add("dsh-llama-preset-scrolling");
+    target.style.setProperty("--dsh-llama-scroll-x", `${distance}px`);
+    target.style.setProperty("--dsh-llama-scroll-dur", `${Math.max(5, Math.min(13, Math.abs(distance) / 14))}s`);
+  } else {
+    target.classList.remove("dsh-llama-preset-scrolling");
+    target.style.removeProperty("--dsh-llama-scroll-x");
+    target.style.removeProperty("--dsh-llama-scroll-dur");
+  }
+}
+
+function refreshLlamaMarquees() {
+  if (!settingsDialogEl) return;
+  settingsDialogEl.querySelectorAll(".dsh-llama-preset-text").forEach(updateLlamaMarquee);
 }
 
 /** 拉取 llama 配置/模型列表/状态并渲染面板。 */
@@ -1881,6 +2153,23 @@ function renderLlamaPanel() {
   if (!settingsDialogEl) return;
   if (llamaData && typeof llamaData === "object") {
     const cfg = llamaData.config || {};
+    const presets = Array.isArray(cfg.presets) && cfg.presets.length > 0
+      ? cfg.presets
+      : [{
+        id: "default",
+        name: "默认预设",
+        modelPath: cfg.modelPath || "",
+        mmprojPath: cfg.mmprojPath || "",
+        host: cfg.host || "127.0.0.1",
+        port: cfg.port ?? 8080,
+        ctxSize: cfg.ctxSize ?? 4096,
+        gpuLayers: cfg.gpuLayers ?? 999,
+        threads: cfg.threads ?? 0,
+        parallel: cfg.parallel ?? 1,
+        apiKey: cfg.apiKey || "",
+        extraArgs: cfg.extraArgs || "",
+      }];
+    const active = presets.find((preset) => preset.id === cfg.activePresetId) || presets[0];
     const dirPath = settingsDialogEl.querySelector("#dsh-llama-dir-path");
     if (dirPath) {
       dirPath.textContent = llamaData.serverExe
@@ -1888,49 +2177,42 @@ function renderLlamaPanel() {
         : (cfg.dir ? `${cfg.dir}（未找到 llama-server.exe）` : "未设置");
       dirPath.style.color = llamaData.serverExe ? "" : "#e45555";
     }
-    const select = settingsDialogEl.querySelector("#dsh-llama-model");
-    const mmprojSelect = settingsDialogEl.querySelector("#dsh-llama-mmproj");
-    if (select || mmprojSelect) {
-      const models = Array.isArray(llamaData.models) ? llamaData.models : [];
-      const current = typeof cfg.modelPath === "string" ? cfg.modelPath : "";
-      const currentMm = typeof cfg.mmprojPath === "string" ? cfg.mmprojPath : "";
-      // mmproj 文件：文件名以 mmproj 开头/包含（视觉投影）
-      const isMmproj = (m) => /(^|[\\/_-]?)mmproj/i.test(m.name) || /mmproj/i.test(m.path);
-      const mainModels = models.filter((m) => !isMmproj(m));
-      const mmModels = models.filter((m) => isMmproj(m));
-      if (select) {
-        let options = mainModels.map((m) =>
-          `<option value="${escHtml(m.path)}"${m.path === current ? " selected" : ""}>${escHtml(llamaModelLabel(m))}</option>`
-        ).join("");
-        if (mainModels.length === 0) {
-          options = `<option value="">（未发现主模型，请将 .gguf 放入 models/ 或点击浏览）</option>`;
-        }
-        if (current && !mainModels.some((m) => m.path === current)) {
-          options = `<option value="${escHtml(current)}" selected>${escHtml(current)}（自定义）</option>${options}`;
-        }
-        select.innerHTML = options;
-      }
-      if (mmprojSelect) {
-        let options = `<option value="">不使用视觉模型</option>` + mmModels.map((m) =>
-          `<option value="${escHtml(m.path)}"${m.path === currentMm ? " selected" : ""}>${escHtml(llamaModelLabel(m))}</option>`
-        ).join("");
-        if (currentMm && !mmModels.some((m) => m.path === currentMm)) {
-          options = `<option value="${escHtml(currentMm)}" selected>${escHtml(currentMm)}（自定义）</option>${options}`;
-        }
-        mmprojSelect.innerHTML = options;
-      }
+    const triggerText = settingsDialogEl.querySelector("#dsh-llama-preset-trigger-text");
+    if (triggerText) {
+      triggerText.textContent = active.name || "未命名预设";
+      triggerText.title = active.name || "未命名预设";
+    }
+    const deleteBtn = settingsDialogEl.querySelector("#dsh-llama-preset-delete");
+    if (deleteBtn) {
+      deleteBtn.disabled = presets.length <= 1;
+      deleteBtn.title = presets.length <= 1 ? "至少保留一个启动预设" : "删除当前启动预设";
+    }
+    const menu = settingsDialogEl.querySelector("#dsh-llama-preset-menu");
+    if (menu) {
+      menu.innerHTML = presets.map((preset) => {
+        const name = preset.name || "未命名预设";
+        const selected = preset.id === active.id;
+        return `<button class="dsh-llama-preset-option${selected ? " dsh-llama-preset-option-on" : ""}" type="button" role="option" aria-selected="${selected}" data-preset-id="${escAttr(preset.id)}" title="${escAttr(name)}"><span class="dsh-llama-preset-text"><span class="dsh-llama-preset-text-inner">${escHtml(name)}</span></span></button>`;
+      }).join("");
     }
     const setVal = (id, value) => {
       const el = settingsDialogEl.querySelector(id);
-      if (el) el.value = value === null || value === undefined ? "" : String(value);
+      if (el) {
+        el.value = value === null || value === undefined ? "" : String(value);
+        if (id === "#dsh-llama-model-path" || id === "#dsh-llama-mmproj-path") el.title = el.value;
+      }
     };
-    setVal("#dsh-llama-port", cfg.port);
-    setVal("#dsh-llama-ctx", cfg.ctxSize);
-    setVal("#dsh-llama-ngl", cfg.gpuLayers);
-    setVal("#dsh-llama-threads", cfg.threads);
-    setVal("#dsh-llama-np", cfg.parallel);
-    setVal("#dsh-llama-apikey", cfg.apiKey);
-    setVal("#dsh-llama-extra", cfg.extraArgs);
+    setVal("#dsh-llama-preset-name", active.name);
+    setVal("#dsh-llama-model-path", active.modelPath);
+    setVal("#dsh-llama-mmproj-path", active.mmprojPath);
+    setVal("#dsh-llama-port", active.port);
+    setVal("#dsh-llama-ctx", active.ctxSize);
+    setVal("#dsh-llama-ngl", active.gpuLayers);
+    setVal("#dsh-llama-threads", active.threads);
+    setVal("#dsh-llama-np", active.parallel);
+    setVal("#dsh-llama-apikey", active.apiKey);
+    setVal("#dsh-llama-extra", active.extraArgs);
+    requestAnimationFrame(refreshLlamaMarquees);
   }
   updateLlamaStatusView();
 }
@@ -1981,7 +2263,8 @@ function setUpdateFoot(text, cls = "", extra = null) {
 function renderNoticeBanner() {
   if (!settingsDialogEl) return;
   if (updateNoticeInfo) {
-    setUpdateFoot(`发现新版本 v${updateNoticeInfo.latest}（当前 v${updateNoticeInfo.current}）`, "dsh-set-foot-new", true);
+    const channel = updateNoticeInfo.channel ? ` ${updateNoticeInfo.channel}` : "";
+    setUpdateFoot(`发现${channel}新版本 v${updateNoticeInfo.latest}（当前 v${updateNoticeInfo.current}）`, "dsh-set-foot-new", true);
   }
 }
 
@@ -2004,10 +2287,12 @@ function renderVersionList() {
   const list = settingsDialogEl.querySelector("#dsh-set-version-list");
   const channel = appSettings.updateChannel || "latest";
   const distTags = versionListData.distTags || {};
-  const latestTag = distTags.latest || null;
+  const channelTag = distTags[channel] || null;
   let versions = versionListData.versions || [];
-  if (channel === "latest" && latestTag) {
-    versions = versions.filter((v) => compareVersionsPreload(v, latestTag) <= 0);
+  if (channelTag) {
+    versions = versions.filter((v) => compareVersionsPreload(v, channelTag) <= 0);
+  } else {
+    versions = [];
   }
   if (versions.length === 0) {
     list.innerHTML = `<div class="dsh-set-version-row" style="justify-content:center;color:var(--dsw-alias-label-tertiary,#8a8f98)">该频道暂无版本</div>`;
@@ -2015,7 +2300,7 @@ function renderVersionList() {
   }
   api.getVersion().then((current) => {
     const currentVersion = current && current.dsh ? current.dsh : null;
-    const highlight = channel === "latest" ? latestTag : (distTags.next || versions[0]);
+    const highlight = channelTag || versions[0];
     const rows = versions.map((v) => {
       const tags = [];
       if (currentVersion && v === currentVersion) tags.push('<span class="dsh-set-version-tag dsh-set-tag-current">当前</span>');
@@ -2045,17 +2330,18 @@ function renderVersionList() {
 }
 
 /** 点击安装版本：主进程切换到启动页安装视图（真实进度 + 取消），完成后自动返回软件。 */
-function startInstallVersion(version) {
+function startInstallVersion(version, channel = appSettings.updateChannel) {
   if (!version || installingVersion) return;
   installingVersion = version;
-  api.installVersion(version);
+  api.installVersion({ version, channel });
 }
 
 /** 更新事件（新版本提示等）驱动设置弹窗底部状态栏。 */
 function handleDesktopUpdateEvent(evt) {
   if (!evt || typeof evt !== "object") return;
   if (evt.type === "notice") {
-    updateNoticeInfo = { current: evt.current, latest: evt.latest };
+    updateNoticeInfo = { current: evt.current, latest: evt.latest, channel: evt.channel || null, channels: evt.channels || null };
+    updateNoticeUnread = true;
     updateSettingsDot();
     renderNoticeBanner();
     return;
@@ -2080,7 +2366,8 @@ function handleUpdateStatus(status) {
     setUpdateFoot(`正在检查更新…（当前 v${updateStatusState.current}）`, "");
   } else if (state === "available") {
     // 有更新时由 notice 事件驱动底部"立即更新"，这里仅提示
-    setUpdateFoot(`发现新版本 v${updateStatusState.latest}`, "dsh-set-foot-new");
+    const channel = updateStatusState.channel ? ` ${updateStatusState.channel}` : "";
+    setUpdateFoot(`发现${channel}新版本 v${updateStatusState.latest}`, "dsh-set-foot-new");
   }
 }
 
@@ -3511,7 +3798,7 @@ function initSplash() {
     retryInstall.hidden = true;
     if (pendingInstallVersionLocal) {
       // 版本安装失败重试：重新走版本安装流程
-      api.installVersion(pendingInstallVersionLocal);
+      api.installVersion({ version: pendingInstallVersionLocal, channel: pendingInstallChannelLocal || appSettings.updateChannel });
       return;
     }
     if (customInstall) {
@@ -3563,9 +3850,12 @@ function initSplash() {
   }
   // 版本安装模式：主进程会在 loadURL 后 400ms 再发送 installing 事件；
   // 这里先主动查询并切换到安装视图（显示版本号 + 进度 + 取消按钮）
-  api.getPendingInstall().then((version) => {
+  api.getPendingInstall().then((pending) => {
+    const version = typeof pending === "string" ? pending : pending && pending.version;
+    const channel = typeof pending === "object" && pending ? pending.channel : null;
     if (!version || !root.isConnected) return;
     pendingInstallVersionLocal = String(version);
+    pendingInstallChannelLocal = channel ? String(channel) : null;
     setPage("installing");
     installTitle.textContent = `正在安装 DeepSeek Harness v${pendingInstallVersionLocal}…`;
     installSub.textContent = "";
@@ -3669,12 +3959,12 @@ const api = {
     return () => ipcRenderer.removeListener("dsh:settings-changed", listener);
   },
   listVersions: () => ipcRenderer.invoke("dsh:list-versions"),
-  installVersion: (version) => ipcRenderer.send("dsh:install-version", version),
+  installVersion: (request) => ipcRenderer.send("dsh:install-version", request),
   // Llama 启动器
   llamaGet: () => ipcRenderer.invoke("dsh:llama-get"),
   llamaSave: (patch) => ipcRenderer.send("dsh:llama-save", patch),
   llamaBrowseDir: () => ipcRenderer.invoke("dsh:llama-browse-dir"),
-  llamaBrowseModel: () => ipcRenderer.invoke("dsh:llama-browse-model"),
+  llamaBrowseModel: (kind) => ipcRenderer.invoke("dsh:llama-browse-model", kind),
   llamaStart: () => ipcRenderer.send("dsh:llama-start"),
   llamaStop: () => ipcRenderer.send("dsh:llama-stop"),
   onLlamaStatusChanged: (cb) => {

@@ -24,12 +24,28 @@ const APP_NAME = "DeepSeek Harness";
 const SERVER_READY_TIMEOUT_MS = 60_000;
 const DSH_INSTALL_READY_TIMEOUT_MS = 15 * 60_000;
 const POLL_INTERVAL_MS = 300;
+const OFFICIAL_REGISTRY = "https://registry.npmjs.org";
+const MIRROR_REGISTRY = "https://registry.npmmirror.com";
+const UPDATE_CHANNELS = ["latest", "next", "alpha"];
+/** 自定义源仍作为镜像侧的首选，可通过 DSH_UPDATE_REGISTRY 指向内网镜像。 */
+const CUSTOM_REGISTRY = process.env.DSH_UPDATE_REGISTRY || null;
 /** 更新源：优先环境变量 DSH_UPDATE_REGISTRY（可指向内网镜像），否则官方镜像 + npmjs 回退 */
 const DEFAULT_REGISTRIES = [
-  process.env.DSH_UPDATE_REGISTRY,
-  "https://registry.npmmirror.com",
-  "https://registry.npmjs.org",
+  CUSTOM_REGISTRY,
+  MIRROR_REGISTRY,
+  OFFICIAL_REGISTRY,
 ].filter(Boolean);
+/** 安装下载源顺序：Latest 镜像优先，Next 官方 npm 优先。 */
+function installRegistriesForChannel(channel = "latest") {
+  const mirrors = [CUSTOM_REGISTRY, MIRROR_REGISTRY].filter(Boolean);
+  const ordered = channel === "next" || channel === "alpha"
+    ? [OFFICIAL_REGISTRY, ...mirrors]
+    : [...mirrors, OFFICIAL_REGISTRY];
+  return [...new Set(ordered)];
+}
+function isUpdateChannel(channel) {
+  return UPDATE_CHANNELS.includes(channel);
+}
 /** 首次运行联网安装用的 Node 版本与国内镜像（npmmirror，失败回退官方源）。 */
 const NODE_VERSION = "v24.14.1";
 const NODE_DOWNLOAD_URLS = [
@@ -375,17 +391,25 @@ const DEFAULT_LLAMA_SETTINGS = {
   apiKey: "",        // API Key（留空=不校验）
   extraArgs: "",     // 附加命令行参数（空格分隔，支持双引号包裹）
 };
+const LLAMA_PRESET_FIELDS = ["modelPath", "mmprojPath", "host", "port", "ctxSize", "gpuLayers", "threads", "parallel", "apiKey", "extraArgs"];
+function defaultLlamaPreset() {
+  const preset = { id: "default", name: "默认预设" };
+  for (const field of LLAMA_PRESET_FIELDS) preset[field] = DEFAULT_LLAMA_SETTINGS[field];
+  return preset;
+}
 const DEFAULT_SETTINGS = {
   balancePlugin: true,    // 余额插件开关（默认打开）
   receiptEnabled: true,   // 小票功能开关（默认打开）
-  updateChannel: "latest",// 版本列表频道：latest / next（默认 Latest）
+  updateChannel: "latest",// 版本列表频道：latest / next / alpha（默认 Latest）
   notifiedVersion: null,  // 已提示过的新版本号（每次新版本只提示一次）
-  llama: { ...DEFAULT_LLAMA_SETTINGS }, // llama.cpp 启动器
+  llama: { ...DEFAULT_LLAMA_SETTINGS, activePresetId: "default", presets: [defaultLlamaPreset()] }, // llama.cpp 启动器
 };
 /** 清洗/规范化 llama 配置（来自 settings.json 或渲染层补丁）。 */
 function sanitizeLlamaSettings(raw) {
   const out = { ...DEFAULT_LLAMA_SETTINGS };
-  if (!raw || typeof raw !== "object") return out;
+  if (!raw || typeof raw !== "object") {
+    return { ...out, activePresetId: "default", presets: [defaultLlamaPreset()] };
+  }
   if (typeof raw.dir === "string") out.dir = raw.dir.trim();
   if (typeof raw.modelPath === "string") out.modelPath = raw.modelPath.trim();
   if (typeof raw.mmprojPath === "string") out.mmprojPath = raw.mmprojPath.trim();
@@ -403,7 +427,45 @@ function sanitizeLlamaSettings(raw) {
   if (typeof raw.apiKey === "string") out.apiKey = raw.apiKey;
   if (typeof raw.extraArgs === "string") out.extraArgs = raw.extraArgs;
   if (typeof raw.autoStart === "boolean") out.autoStart = raw.autoStart;
+  const presets = [];
+  const seen = new Set();
+  const rawPresets = Array.isArray(raw.presets) ? raw.presets : [];
+  for (const presetRaw of rawPresets) {
+    if (!presetRaw || typeof presetRaw !== "object") continue;
+    const base = { ...DEFAULT_LLAMA_SETTINGS, ...presetRaw };
+    const id = typeof presetRaw.id === "string" && presetRaw.id.trim() !== ""
+      ? presetRaw.id.trim()
+      : `preset-${presets.length + 1}`;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const preset = { id, name: typeof presetRaw.name === "string" && presetRaw.name.trim() !== "" ? presetRaw.name.trim() : `预设 ${presets.length + 1}` };
+    const clean = sanitizeLlamaSettings({ ...base, presets: [] });
+    for (const field of LLAMA_PRESET_FIELDS) preset[field] = clean[field];
+    presets.push(preset);
+  }
+  if (presets.length === 0) {
+    const migrated = { id: "default", name: "默认预设" };
+    for (const field of LLAMA_PRESET_FIELDS) migrated[field] = out[field];
+    presets.push(migrated);
+  }
+  out.presets = presets;
+  out.activePresetId = typeof raw.activePresetId === "string" && presets.some((preset) => preset.id === raw.activePresetId)
+    ? raw.activePresetId
+    : presets[0].id;
+  const active = presets.find((preset) => preset.id === out.activePresetId);
+  if (active) {
+    for (const field of LLAMA_PRESET_FIELDS) out[field] = active[field];
+  }
   return out;
+}
+function activeLlamaPreset(settings = appSettings.llama) {
+  const presets = settings && Array.isArray(settings.presets) ? settings.presets : [];
+  if (presets.length === 0) return defaultLlamaPreset();
+  return presets.find((preset) => preset.id === settings.activePresetId) || presets[0];
+}
+function activeLlamaConfig(settings = appSettings.llama) {
+  const preset = activeLlamaPreset(settings);
+  return { ...settings, ...preset };
 }
 let appSettings = { ...DEFAULT_SETTINGS };
 function loadAppSettings() {
@@ -414,7 +476,7 @@ function loadAppSettings() {
         ...DEFAULT_SETTINGS,
         ...(typeof parsed.balancePlugin === "boolean" ? { balancePlugin: parsed.balancePlugin } : {}),
         ...(typeof parsed.receiptEnabled === "boolean" ? { receiptEnabled: parsed.receiptEnabled } : {}),
-        ...(parsed.updateChannel === "latest" || parsed.updateChannel === "next" ? { updateChannel: parsed.updateChannel } : {}),
+        ...(isUpdateChannel(parsed.updateChannel) ? { updateChannel: parsed.updateChannel } : {}),
         ...(typeof parsed.notifiedVersion === "string" && parsed.notifiedVersion.trim() !== "" ? { notifiedVersion: parsed.notifiedVersion } : {}),
         ...(parsed.llama !== undefined ? { llama: sanitizeLlamaSettings(parsed.llama) } : {}),
       };
@@ -533,7 +595,7 @@ function llamaBuildArgs(cfg) {
 /** 启动 llama-server：spawn 子进程 + 轮询 /health 直到就绪（大模型加载可能耗时数分钟）。
  * onProgress(percent, stage)：可选进度回调，把真实阶段写入启动页进度条。 */
 async function startLlamaServer(onProgress = null) {
-  const cfg = appSettings.llama;
+  const cfg = activeLlamaConfig();
   if (llamaStatus.state === "running") return { ok: false, error: "llama-server 已在运行" };
   if (llamaStatus.state === "starting") return { ok: false, error: "llama-server 正在启动，请稍候" };
   if (!cfg) return { ok: false, error: "llama 配置未初始化" };
@@ -670,7 +732,7 @@ function stopLlamaServer() {
 /** llama 跟随软件启动：在拉起 harness 服务之前先启动 llama-server，真实进度写入启动页进度条。
  *  失败不阻塞 harness 启动（仅记录日志）。 */
 async function maybeStartLlamaBeforeHarness(win) {
-  const cfg = appSettings.llama;
+  const cfg = activeLlamaConfig();
   if (!cfg || !cfg.autoStart || !cfg.modelPath) return;
   if (llamaStatus.state === "running" || llamaStatus.state === "starting") return;
   const exe = llamaServerExePath();
@@ -816,6 +878,8 @@ const bootPayloadCache = new WeakMap();
 // ---------- 版本安装（设置弹窗 → 启动页安装视图） ----------
 /** 当前正在安装的版本（供启动页安装视图显示与取消）。 */
 let pendingInstallVersion = null;
+/** 当前正在安装版本所属频道（供失败重试沿用下载源顺序）。 */
+let pendingInstallChannel = null;
 /** 用户是否请求取消本次安装。 */
 let cancelInstallRequested = false;
 /** 当前活跃的 npm 安装子进程（取消时结束其进程树）。 */
@@ -1200,6 +1264,7 @@ async function installManagedDsh(
   {
     version = null,
     registry = null,
+    channel = appSettings.updateChannel,
     baseDir = managedDshRuntimeDir(),
     keepBackup = false,
   } = {}
@@ -1210,8 +1275,7 @@ async function installManagedDsh(
     return false;
   }
 
-  // 未显式指定版本 → 安装官方最新版本（dist-tags 中 semver 最高者，如 0.1.0-rc.8），
-  // 而不是固定在 0.1.0-rc.7；解析失败才回退到 latest 标签。
+  // 未显式指定版本 → 安装当前更新频道对应的 dist-tag 版本。
   if (!version) {
     const newest = await latestDshVersion();
     if (newest && newest.version) {
@@ -1220,7 +1284,7 @@ async function installManagedDsh(
     } else {
       version = "latest";
     }
-    sendBootLog(win, `将安装 DeepSeek Harness 最新版本：${version}`);
+    sendBootLog(win, `将安装 DeepSeek Harness ${channel || "latest"} 频道版本：${version}`);
   }
 
   const target = assertSafeManagedPath(baseDir);
@@ -1251,10 +1315,10 @@ async function installManagedDsh(
     fs.mkdirSync(staging, { recursive: true });
     setStage("正在安装 DeepSeek Harness…", 0);
 
-    // 候选源：显式指定的 registry 优先，随后按 DEFAULT_REGISTRIES 顺序回退
-    // （npmmirror 镜像对 rc 版本可能存在同步滞后，装不上时自动尝试 npmjs）
+    // 候选源按当前频道排序：Next/Alpha 频道优先官方 npm，Latest 频道优先 npmmirror。
+    // 检查阶段返回的 registry 只作为补充回退源，避免镜像同步滞后时抢先安装失败。
     const candidateRegistries = [...new Set(
-      [registry || null, ...DEFAULT_REGISTRIES].filter(Boolean)
+      [...installRegistriesForChannel(channel), registry || null].filter(Boolean)
     )];
 
     creep = setInterval(() => {
@@ -1841,49 +1905,71 @@ async function fetchJson(url, timeoutMs = 10_000, accept = "application/json") {
   }
 }
 
-/**
- * 查询官方最新版本（按 registry 顺序回退）。
- * 不能只看 `latest` dist-tag：官方把 rc 版本发布在 `next` 标签下
- * （如 latest=0.1.0-rc.7 而 next=0.1.0-rc.8），因此取全部 dist-tags
- * 与已发布版本中 semver 最高的那个作为"最新版本"。
- */
-async function latestDshVersion() {
-  for (const registry of DEFAULT_REGISTRIES) {
-    try {
-      const data = await fetchJson(
-        `${registry}/@deepseek-ai/dsh`,
-        8000,
-        "application/vnd.npm.install-v1+json"
-      );
-      if (data && typeof data === "object") {
-        const candidates = new Set();
-        if (data["dist-tags"] && typeof data["dist-tags"] === "object") {
-          for (const tag of Object.values(data["dist-tags"])) {
-            if (typeof tag === "string" && tag.trim() !== "") candidates.add(tag.trim());
-          }
-        }
-        if (data.versions && typeof data.versions === "object") {
-          for (const version of Object.keys(data.versions)) {
-            if (version.trim() !== "") candidates.add(version.trim());
-          }
-        }
-        let best = null;
-        for (const candidate of candidates) {
-          if (!best || compareVersions(candidate, best) > 0) best = candidate;
-        }
-        if (best) return { version: best, registry };
+async function fetchChannelVersion(registry, tag) {
+  try {
+    const data = await fetchJson(
+      `${registry}/@deepseek-ai/dsh`,
+      8000,
+      "application/vnd.npm.install-v1+json"
+    );
+    if (data && typeof data === "object") {
+      const version = data["dist-tags"] && typeof data["dist-tags"] === "object"
+        ? data["dist-tags"][tag]
+        : null;
+      if (typeof version === "string" && version.trim() !== "") {
+        return { version: version.trim(), registry, channel: tag };
       }
-    } catch (err) {
-      log(`registry ${registry} packument failed: ${err.message}`);
     }
-    try {
-      const latest = await fetchJson(`${registry}/@deepseek-ai/dsh/latest`, 4500);
-      if (latest && typeof latest.version === "string") return { version: latest.version, registry };
-    } catch (err) {
-      log(`registry ${registry} latest failed: ${err.message}`);
+  } catch (err) {
+    log(`registry ${registry} packument(${tag}) failed: ${err.message}`);
+  }
+  try {
+    const tagged = await fetchJson(`${registry}/@deepseek-ai/dsh/${tag}`, 4500);
+    if (tagged && typeof tagged.version === "string") {
+      return { version: tagged.version, registry, channel: tag };
     }
+  } catch (err) {
+    log(`registry ${registry} ${tag} failed: ${err.message}`);
   }
   return null;
+}
+
+/** 查询单个更新频道的 npm dist-tag 版本。 */
+async function latestDshVersionForChannel(channel = "latest") {
+  const tag = isUpdateChannel(channel) ? channel : "latest";
+  for (const registry of DEFAULT_REGISTRIES) {
+    const found = await fetchChannelVersion(registry, tag);
+    if (found) return found;
+  }
+  return null;
+}
+
+/** 同时查询全部更新频道的 npm dist-tag 版本。 */
+async function latestDshVersions() {
+  const entries = await Promise.all(
+    UPDATE_CHANNELS.map(async (channel) => [channel, await latestDshVersionForChannel(channel)])
+  );
+  const results = {};
+  for (const [channel, result] of entries) {
+    if (result) results[channel] = result;
+  }
+  return Object.keys(results).length > 0 ? results : null;
+}
+
+/** 从多个频道的版本中选择最高版本；返回值保留 channel 供安装阶段选择下载源。 */
+function selectNewestDshVersion(versions) {
+  return Object.values(versions || {})
+    .filter((entry) => entry && typeof entry.version === "string")
+    .sort((a, b) => {
+      const versionOrder = compareVersions(b.version, a.version);
+      if (versionOrder !== 0) return versionOrder;
+      return UPDATE_CHANNELS.indexOf(a.channel) - UPDATE_CHANNELS.indexOf(b.channel);
+    })[0] || null;
+}
+
+/** 查询当前设置频道的版本，供首次安装等单频道场景使用。 */
+async function latestDshVersion(channel = appSettings.updateChannel) {
+  return latestDshVersionForChannel(channel);
 }
 
 /** 向窗口安全发送状态（窗口可能已销毁）。 */
@@ -2023,8 +2109,8 @@ async function listDshVersions() {
 }
 
 /** 探测能提供指定版本 dsh 的 registry（镜像对 rc 版本可能存在同步滞后，装不上时按序回退）。 */
-async function resolveRegistryForVersion(version) {
-  for (const registry of DEFAULT_REGISTRIES) {
+async function resolveRegistryForVersion(version, channel = appSettings.updateChannel) {
+  for (const registry of installRegistriesForChannel(channel)) {
     try {
       const data = await fetchJson(
         `${registry}/@deepseek-ai/dsh`,
@@ -2039,18 +2125,19 @@ async function resolveRegistryForVersion(version) {
       log(`resolve registry ${registry} for ${version} failed: ${err.message}`);
     }
   }
-  return DEFAULT_REGISTRIES[0] || null;
+  return installRegistriesForChannel(channel)[0] || null;
 }
 
 /**
- * 静默检查更新（监控 Next 频道：取全部 dist-tags 与版本中 semver 最高者）。
+ * 静默检查更新（同时监控 Latest / Next / Alpha 三个 npm dist-tag）。
  * 发现新版本时通过设置弹窗内的更新提示通知一次（notifiedVersion 持久化，每个版本只提示一次）。
  */
 async function autoCheckUpdates(win) {
   const current = bundledDshVersion();
   sendStatus(win, { state: "checking", current });
-  const latest = await latestDshVersion();
-  log(`auto update check: current=${current} latest=${latest ? latest.version : "N/A"}`);
+  const channelVersions = await latestDshVersions();
+  const latest = selectNewestDshVersion(channelVersions);
+  log(`auto update check: current=${current} latest=${latest ? `${latest.version}/${latest.channel}` : "N/A"}`);
   if (!latest) {
     sendStatus(win, { state: "idle", current });
     sendEvent(win, {
@@ -2061,15 +2148,15 @@ async function autoCheckUpdates(win) {
     return;
   }
   if (compareVersions(latest.version, current) > 0) {
-    sendStatus(win, { state: "available", current, latest: latest.version });
-    if (appSettings.notifiedVersion !== latest.version) {
-      appSettings.notifiedVersion = latest.version;
+    sendStatus(win, { state: "available", current, latest: latest.version, channel: latest.channel, channels: channelVersions });
+    if (appSettings.notifiedVersion !== `${latest.channel}:${latest.version}`) {
+      appSettings.notifiedVersion = `${latest.channel}:${latest.version}`;
       saveAppSettings();
-      sendEvent(win, { type: "notice", current, latest: latest.version });
+      sendEvent(win, { type: "notice", current, latest: latest.version, channel: latest.channel, channels: channelVersions });
     }
   } else {
     sendStatus(win, { state: "idle", current });
-    sendEvent(win, { type: "no-update", current, latest: latest.version });
+    sendEvent(win, { type: "no-update", current, latest: latest.version, channel: latest.channel, channels: channelVersions });
   }
 }
 
@@ -2081,14 +2168,16 @@ async function autoCheckUpdates(win) {
  * 安装指定版本：先切换到本地启动页的"安装视图"（真实进度条 + 日志 + 取消按钮），
  * 在安装视图内完成下载/安装/替换，完成后自动返回软件主界面；取消/失败则恢复旧版本并返回。
  */
-async function installVersionWithSplash(win, version) {
+async function installVersionWithSplash(win, version, channel = appSettings.updateChannel) {
   if (updating || !win || win.isDestroyed()) return;
   updating = true;
   cancelInstallRequested = false;
   activeInstallChild = null;
   try {
     const current = bundledDshVersion();
+    const installChannel = isUpdateChannel(channel) ? channel : "latest";
     pendingInstallVersion = version;
+    pendingInstallChannel = installChannel;
 
     // 1) 先切到本地启动页安装视图（不依赖服务器），再开始安装
     const splashUrl = pathToFileURL(path.join(__dirname, "assets", "splash.html")).href;
@@ -2102,6 +2191,7 @@ async function installVersionWithSplash(win, version) {
       stage: `正在安装 DeepSeek Harness v${version}…`,
       percent: 0,
       installMode: "global",
+      channel: installChannel,
       detectComplete: true,
     });
     sendBootLog(win, `开始安装 DeepSeek Harness v${version}`);
@@ -2112,8 +2202,13 @@ async function installVersionWithSplash(win, version) {
     setRuntimeMode("global");
     nativeRuntime = await probeNodeToolchain();
     // 先探测哪个源有这个版本（npmmirror 可能滞后），安装失败时 installManagedDsh 还会继续回退其他源
-    const installRegistry = await resolveRegistryForVersion(version);
-    const installResult = await installManagedDsh(win, { version, registry: installRegistry, keepBackup: true });
+    const installRegistry = await resolveRegistryForVersion(version, installChannel);
+    const installResult = await installManagedDsh(win, {
+      version,
+      registry: installRegistry,
+      channel: installChannel,
+      keepBackup: true,
+    });
     setRuntimeMode(previousMode);
     activeInstallChild = null;
 
@@ -2144,7 +2239,8 @@ async function installVersionWithSplash(win, version) {
       }
     }
 
-    // 4) 取消 / 安装失败：恢复旧版本并重启旧服务，然后返回主界面
+    // 4) 取消 / 安装失败：恢复旧版本并重启旧服务。
+    // 失败时停留在启动页，明确展示失败结果；由用户点击“返回软件”进入主界面。
     if (!cancelInstallRequested) sendBootLog(win, "DeepSeek Harness 安装失败，正在恢复旧版本…");
     const restoredFiles = restoreManagedDshBackup(installResult);
     if (restoredFiles) {
@@ -2158,13 +2254,29 @@ async function installVersionWithSplash(win, version) {
     } catch { /* ignore */ }
     if (restoredPort !== null) {
       pendingBootUrl = `http://127.0.0.1:${restoredPort}`;
-      sendBootLog(win, cancelInstallRequested ? "已取消安装，返回软件" : "旧版本服务已恢复，返回软件");
-      await delay(500);
-      if (!win.isDestroyed()) {
-        const target = pendingBootUrl;
-        pendingBootUrl = null;
-        win.loadURL(target);
+      if (cancelInstallRequested) {
+        sendBootLog(win, "已取消安装，旧版本服务已恢复，正在返回软件");
+        await delay(500);
+        if (!win.isDestroyed()) {
+          const target = pendingBootUrl;
+          pendingBootUrl = null;
+          win.loadURL(target);
+        }
+        return;
       }
+      sendBootLog(win, cancelInstallRequested
+        ? "已取消安装，旧版本服务已恢复，请点击“返回软件”"
+        : "安装失败，旧版本服务已恢复，请点击“返回软件”");
+      sendBoot(win, {
+        page: "installing",
+        installing: false,
+        installError: true,
+        stage: cancelInstallRequested
+          ? "安装已取消，旧版本已恢复，请点击返回软件"
+          : "安装失败，旧版本已恢复，请点击返回软件",
+        percent: 0,
+        installMode: "global",
+      });
       return;
     }
     // 服务未能恢复：停留在安装视图并提示（提供返回按钮由渲染层触发 dsh:return-to-app）
@@ -2173,7 +2285,7 @@ async function installVersionWithSplash(win, version) {
       installing: false,
       installError: true,
       stage: cancelInstallRequested
-        ? "安装已取消，但服务未能恢复，请重启软件"
+        ? "安装已取消，正在恢复旧版本，请稍后重试或重启软件"
         : "安装失败，旧版本服务未能恢复，请重启软件",
       percent: 0,
       installMode: "global",
@@ -2181,6 +2293,7 @@ async function installVersionWithSplash(win, version) {
   } finally {
     updating = false;
     pendingInstallVersion = null;
+    pendingInstallChannel = null;
   }
 }
 
@@ -2197,11 +2310,13 @@ async function performUpdate(win, { silent = false } = {}) {
 
     // ---- 检查阶段（失败可重试） ----
     let latest = null;
+    let channelVersions = null;
     while (true) {
       if (silent) sendStatus(win, { state: "checking", current });
       else sendEvent(win, { type: "checking", current });
-      latest = await latestDshVersion();
-      log(`update check: current=${current} latest=${latest ? latest.version : "N/A"} silent=${silent}`);
+      channelVersions = await latestDshVersions();
+      latest = selectNewestDshVersion(channelVersions);
+      log(`update check: current=${current} latest=${latest ? `${latest.version}/${latest.channel}` : "N/A"} silent=${silent}`);
       if (latest !== null) break;
       sendStatus(win, { state: "idle", current });
       if (silent) return;
@@ -2220,18 +2335,18 @@ async function performUpdate(win, { silent = false } = {}) {
     if (compareVersions(latest.version, current) <= 0) {
       sendStatus(win, { state: "idle", current });
       if (silent) return;
-      sendEvent(win, { type: "up-to-date", current, latest: latest.version });
+      sendEvent(win, { type: "up-to-date", current, latest: latest.version, channel: latest.channel, channels: channelVersions });
       await waitForUpdateAction(win);
       sendEvent(win, { type: "close" });
       return;
     }
 
     // 有更新：先通知按钮切换为绿色箭头；静默模式到此为止
-    sendStatus(win, { state: "available", current, latest: latest.version });
+    sendStatus(win, { state: "available", current, latest: latest.version, channel: latest.channel, channels: channelVersions });
     if (silent) return;
 
     // 打开确认弹窗；更新说明异步拉取后填充
-    sendEvent(win, { type: "available", current, latest: latest.version, changelog: null });
+    sendEvent(win, { type: "available", current, latest: latest.version, channel: latest.channel, channels: channelVersions, changelog: null });
     fetchChangelog()
       .then((cl) => { if (cl) sendEvent(win, { type: "available-changelog", changelog: cl }); })
       .catch((err) => log(`changelog failed: ${err.message}`));
@@ -2244,15 +2359,20 @@ async function performUpdate(win, { silent = false } = {}) {
 
     // ---- 安装阶段（失败可重试） ----
     while (true) {
-      sendStatus(win, { state: "updating", current, latest: latest.version });
-      sendEvent(win, { type: "updating", current, latest: latest.version });
+      sendStatus(win, { state: "updating", current, latest: latest.version, channel: latest.channel, channels: channelVersions });
+      sendEvent(win, { type: "updating", current, latest: latest.version, channel: latest.channel, channels: channelVersions });
       // 更新期间先停止服务器：Windows 下正在运行的原生模块文件会被锁定，
       // 不停服直接替换 node_modules 会导致 npm 安装失败。
       killServerTree();
       const previousMode = runtimeMode;
       setRuntimeMode("global");
       nativeRuntime = await probeNodeToolchain();
-      const installResult = await installManagedDsh(win, { version: latest.version, registry: latest.registry, keepBackup: true });
+      const installResult = await installManagedDsh(win, {
+        version: latest.version,
+        registry: latest.registry,
+        channel: latest.channel || appSettings.updateChannel,
+        keepBackup: true,
+      });
       setRuntimeMode(previousMode);
       const newPort = installResult ? await startServer(win, { readyBeforeLoad: true }) : null;
       if (newPort !== null) {
@@ -2283,6 +2403,8 @@ async function performUpdate(win, { silent = false } = {}) {
         type: "update-failed",
         current,
         latest: latest.version,
+        channel: latest.channel,
+        channels: channelVersions,
         restored: recovered,
         detail: recovered
           ? "通过 npm 安装 DeepSeek Harness 失败，已恢复旧版本运行。"
@@ -2312,7 +2434,7 @@ async function performUpdate(win, { silent = false } = {}) {
       win.loadURL(target);
     }
     await ready;
-    sendEvent(win, { type: "success", current, latest: latest.version });
+    sendEvent(win, { type: "success", current, latest: latest.version, channel: latest.channel, channels: channelVersions });
     await waitForUpdateAction(win);
     sendEvent(win, { type: "close" });
   } finally {
@@ -2436,7 +2558,7 @@ function registerIpc() {
     for (const key of ["balancePlugin", "receiptEnabled"]) {
       if (typeof patch[key] === "boolean") next[key] = patch[key];
     }
-    if (patch.updateChannel === "latest" || patch.updateChannel === "next") next.updateChannel = patch.updateChannel;
+    if (patch.updateChannel === "latest" || patch.updateChannel === "next" || patch.updateChannel === "alpha") next.updateChannel = patch.updateChannel;
     if (typeof patch.notifiedVersion === "string") next.notifiedVersion = patch.notifiedVersion;
     if (patch.llama && typeof patch.llama === "object") next.llama = sanitizeLlamaSettings(patch.llama);
     appSettings = next;
@@ -2453,7 +2575,7 @@ function registerIpc() {
       serverExe: !!exe && fs.existsSync(exe),
     };
   });
-  // llama.cpp 启动器：保存配置补丁（目录/模型/参数/跟随启动）
+  // llama.cpp 启动器：保存配置补丁（全局设置 + 启动预设）
   ipcMain.on("dsh:llama-save", (event, patch) => {
     if (!patch || typeof patch !== "object") return;
     appSettings.llama = sanitizeLlamaSettings({ ...appSettings.llama, ...patch });
@@ -2472,14 +2594,15 @@ function registerIpc() {
     if (result.canceled || result.filePaths.length === 0) return null;
     return result.filePaths[0];
   });
-  ipcMain.handle("dsh:llama-browse-model", async (event) => {
+  ipcMain.handle("dsh:llama-browse-model", async (event, kind = "model") => {
     const win = BrowserWindow.fromWebContents(event.sender);
     if (!win) return null;
-    const cfg = appSettings.llama || {};
-    const defaultPath = cfg.modelPath
+    const cfg = activeLlamaConfig();
+    const mmproj = kind === "mmproj";
+    const defaultPath = (mmproj ? cfg.mmprojPath : cfg.modelPath)
       || (cfg.dir ? path.join(cfg.dir, "models") : undefined);
     const result = await dialog.showOpenDialog(win, {
-      title: "选择 GGUF 模型文件",
+      title: mmproj ? "选择视觉模型文件（mmproj）" : "选择主模型文件（GGUF）",
       buttonLabel: "选择此文件",
       defaultPath,
       filters: [{ name: "GGUF 模型", extensions: ["gguf"] }],
@@ -2500,10 +2623,12 @@ function registerIpc() {
     stopLlamaServer();
   });
   ipcMain.handle("dsh:list-versions", () => listDshVersions());
-  ipcMain.on("dsh:install-version", (event, version) => {
+  ipcMain.on("dsh:install-version", (event, request) => {
     const win = BrowserWindow.fromWebContents(event.sender);
+    const version = typeof request === "string" ? request : request && request.version;
+    const channel = typeof request === "object" && request ? request.channel : null;
     if (!win || typeof version !== "string" || version.trim() === "") return;
-    installVersionWithSplash(win, version.trim()).catch((err) => log(`install-version failed: ${err.message}`));
+    installVersionWithSplash(win, version.trim(), channel).catch((err) => log(`install-version failed: ${err.message}`));
   });
   ipcMain.on("dsh:cancel-install", (event) => {
     const win = BrowserWindow.fromWebContents(event.sender);
@@ -2513,7 +2638,9 @@ function registerIpc() {
     // 通知启动页安装视图立即切换为"正在取消"
     sendBootLog(win, "正在取消安装…");
   });
-  ipcMain.handle("dsh:get-pending-install", () => pendingInstallVersion);
+  ipcMain.handle("dsh:get-pending-install", () => pendingInstallVersion
+    ? { version: pendingInstallVersion, channel: pendingInstallChannel }
+    : null);
   ipcMain.handle("dsh:return-to-app", async (event) => {
     const win = BrowserWindow.fromWebContents(event.sender);
     if (!win) return { ok: false };
@@ -2838,7 +2965,7 @@ async function bootServer(win, options = {}) {
   // 页面渲染出主题底色后（dsh:theme 上报）再由主进程恢复毛玻璃透明底。
   win.loadURL(url);
 
-  // 启动后静默检查一次更新（监控 Next 频道，发现新版本只通过设置弹窗提示一次）：
+  // 启动后静默检查一次更新（同时监控 Latest / Next / Alpha，发现新版本只通过设置弹窗提示一次）：
   // 等页面 preload 上报就绪后再触发，避免页面还在加载、状态事件丢失。
   const autoCheck = () => {
     autoCheckUpdates(win).catch((err) => log(`auto-check failed: ${err.message}`));

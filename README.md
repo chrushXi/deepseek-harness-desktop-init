@@ -152,7 +152,7 @@ npm run dist
 ## 更新说明
 
 - **更新源**：npm 官方源（默认 `registry.npmmirror.com`，失败自动回退 `registry.npmjs.org`）；可用环境变量 `DSH_UPDATE_REGISTRY=https://你的内网镜像` 自定义。
-- **监控频道**：静默监控 Next 频道（取全部 dist-tags 与版本中 semver 最高者），每个新版本只通过设置弹窗提示一次。
+- **监控频道**：同时检测 Latest / Next / Alpha 三个 npm dist-tag，发现最高版本后按该版本所属频道执行安装，每个新版本只通过设置弹窗提示一次。
 - **更新流程**：停服 → `npm install @deepseek-ai/dsh@指定版本` → 重启服务 → 自动返回主界面；失败自动恢复旧版本。
 
 ## 异常自愈
