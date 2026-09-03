@@ -590,8 +590,8 @@ window.__ModuleLoader__.load({
 		}
 		//#endregion
 		//#region packages/client/ui-token-monitor/src/client/index.ts
-		/** 依赖：slot 注册 + Conversation Node 事件装配。 */
-		const inject = ["slots", "conversationEvents"];
+		/** 依赖 slots；Conversation 事件注册兼容 dsh 新旧服务名。 */
+		const inject = ["slots"];
 		/**
 		* 当前会话上报组件（不可见）：把当前选中的会话 id 写入
 		* document.body.dataset.dshActiveSession，供桌面标题栏「打印小票」定位会话。
@@ -607,7 +607,12 @@ window.__ModuleLoader__.load({
 			return null;
 		});
 		function apply(ctx) {
-			ctx.conversationEvents.register(tokenUsageNodeDefinition);
+			// dsh <= 0.1.1 exposes conversationEvents directly; dsh >= 0.1.2
+			// exposes the registry as uiConversation.events.
+			const conversationEvents = ctx.get("uiConversation")?.events || ctx.get("conversationEvents");
+			if (conversationEvents && typeof conversationEvents.register === "function") {
+				conversationEvents.register(tokenUsageNodeDefinition);
+			}
 			ctx.slots.inject("conversation.chat.node", () => ctx.slots.register({
 				name: "conversation.chat.node",
 				key: "token-usage"

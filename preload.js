@@ -2367,7 +2367,7 @@ function handleUpdateStatus(status) {
   } else if (state === "available") {
     // 有更新时由 notice 事件驱动底部"立即更新"，这里仅提示
     const channel = updateStatusState.channel ? ` ${updateStatusState.channel}` : "";
-    setUpdateFoot(`发现${channel}新版本 v${updateStatusState.latest}`, "dsh-set-foot-new");
+    setUpdateFoot(`发现${channel}新版本 v${updateStatusState.latest}`, "dsh-set-foot-new", true);
   }
 }
 
@@ -3716,8 +3716,8 @@ function initSplash() {
       barRow.hidden = false;
       logOuter.classList.add("dsh-splash-log-on");
       retryInstall.hidden = payload.installError !== true;
-      // 版本安装视图：安装中显示"取消安装"，失败/取消且无法恢复时显示"返回软件"
-      if (pendingInstallVersionLocal) {
+      // 安装视图：安装中显示"取消安装"，失败/取消时显示"返回软件"
+      if (pendingInstallVersionLocal || payload.showReturnApp === true) {
         installActionsRow.hidden = false;
         cancelInstallBtn.hidden = payload.installError === true;
         cancelInstallBtn.disabled = payload.installError === true;

@@ -629,12 +629,23 @@ async function migrateMissingTokenCost(ctx) {
 	try {
 		const headers = await ctx.sessionPersistence.list();
 		let migrated = 0;
+		let skipped = 0;
 		for (const header of headers) {
-			if (ctx.sessionProjectionCache.cachedSnapshot(header)?.values.tokenCost !== void 0) continue;
-			await ctx.sessionProjectionCache.coldSnapshot(header.id);
-			migrated++;
+			try {
+				if (!header || typeof header.id !== "string" || header.id === "") {
+					skipped++;
+					continue;
+				}
+				if (ctx.sessionProjectionCache.cachedSnapshot(header)?.values.tokenCost !== void 0) continue;
+				await ctx.sessionProjectionCache.coldSnapshot(header.id);
+				migrated++;
+			} catch (error) {
+				skipped++;
+				console.warn(`[dsh-damage-pulse] 跳过历史会话 ${String(header?.id ?? "unknown")} 投影迁移: ${String(error).slice(0, 300)}`);
+			}
 		}
 		if (migrated > 0) console.log(`[dsh-damage-pulse] 已为 ${migrated} 个历史会话重建 tokenCost 投影`);
+		if (skipped > 0) console.warn(`[dsh-damage-pulse] 有 ${skipped} 个历史会话无法迁移，将在后续打开时重试`);
 	} catch (error) {
 		console.warn(`[dsh-damage-pulse] 历史会话投影迁移失败: ${String(error)}`);
 	}

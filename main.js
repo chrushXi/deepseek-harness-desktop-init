@@ -651,6 +651,21 @@ async function startLlamaServer(onProgress = null) {
   };
   child.stdout.on("data", receive);
   child.stderr.on("data", receive);
+  child.on("error", (error) => {
+    if (llamaChild !== child) return;
+    llamaChild = null;
+    const message = error instanceof Error ? error.message : String(error);
+    llamaStatus = {
+      ...llamaStatus,
+      state: "error",
+      pid: null,
+      port: null,
+      endpoint: null,
+      error: `llama-server 启动失败：${message}`,
+    };
+    llamaLog(`spawn failed: ${message}`);
+    broadcastLlamaStatus();
+  });
   child.on("exit", (code, signal) => {
     llamaLog(`llama-server exited code=${code} signal=${signal}`);
     if (llamaChild !== child) return; // 已被 stopLlamaServer 接管
@@ -868,6 +883,8 @@ if (!gotLock) {
 // ---------- 服务器子进程 ----------
 let serverChild = null;
 let pendingBootUrl = null;
+/** dsh 0.1.2+ may require a process-local token in the printed URL. */
+let lastServerUrl = null;
 let quitting = false;
 /** 是否为主动停止（更新等场景），此时子进程退出不算事故 */
 let serverStopping = false;
@@ -1336,7 +1353,11 @@ async function installManagedDsh(
     let installErrorTail = "";
     for (const reg of candidateRegistries) {
       if (cancelInstallRequested) break;
-      sendBootLog(win, `npm install --prefix "${staging}" ${spec} --registry=${reg} --package-lock=false --prefer-offline`);
+      // Versioned installs must revalidate stale packument metadata.  The managed
+      // cache can lag behind npm by several releases, and --prefer-offline makes
+      // npm trust that stale version list and fail with ETARGET for newly published
+      // versions even when the registry is reachable.
+      sendBootLog(win, `npm install --prefix "${staging}" ${spec} --registry=${reg} --package-lock=false --prefer-online`);
       const attemptArgs = [
         ...npm.argsPrefix,
         "install",
@@ -1346,7 +1367,7 @@ async function installManagedDsh(
         "--no-audit",
         "--no-fund",
         "--package-lock=false",
-        "--prefer-offline",
+        "--prefer-online",
         spec,
       ];
       result = await runLoggedCommand(npm.command, attemptArgs, {
@@ -1569,10 +1590,30 @@ function probeHttp(port, pathname = "/") {
   return new Promise((resolve) => {
     const req = http.get({ host: "127.0.0.1", port, path: pathname, timeout: 1500 }, (res) => {
       res.resume();
-      resolve(res.statusCode === 200);
+      // HTTP probing is used by optional llama-server health checks. A 2xx or
+      // 3xx response means the endpoint answered; desktop readiness uses TCP
+      // probing below and does not depend on HTTP authentication behavior.
+      resolve(typeof res.statusCode === "number" && res.statusCode >= 200 && res.statusCode < 400);
     });
     req.on("error", () => resolve(false));
     req.on("timeout", () => { req.destroy(); resolve(false); });
+  });
+}
+
+/** Check only whether the local server socket is accepting connections. */
+function probeLocalPort(port, host = "127.0.0.1") {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host, port });
+    let settled = false;
+    const finish = (ready) => {
+      if (settled) return;
+      settled = true;
+      try { socket.destroy(); } catch { /* ignore */ }
+      resolve(ready);
+    };
+    socket.setTimeout(1500, () => finish(false));
+    socket.once("connect", () => finish(true));
+    socket.once("error", () => finish(false));
   });
 }
 
@@ -1680,11 +1721,13 @@ async function startServer(win, options = {}) {
     shell: false,
   });
   serverChild = child;
+  lastServerUrl = null;
   serverStopping = false;
   startupStderr = "";
 
   let port = null;
-  const urlLine = /(?:dsh web: )?https?:\/\/(?:127\.0\.0\.1|localhost):(\d+)/i;
+  let serverOutputBuffer = "";
+  let spawnError = null;
   let stalled = false;
   let verboseProgress = 0;
   const startedAt = Date.now();
@@ -1722,26 +1765,36 @@ async function startServer(win, options = {}) {
     try { clearInterval(stallTimer); } catch { /* ignore */ }
     try { if (verboseProgressTimer) clearInterval(verboseProgressTimer); } catch { /* ignore */ }
   };
+  child.on("error", (error) => {
+    spawnError = error instanceof Error ? error : new Error(String(error));
+    log(`server spawn failed: ${redactServerAuth(spawnError.message)}`);
+  });
   child.stdout.on("data", (chunk) => {
     const text = chunk.toString();
     markActive();
-    log(`[server] ${text.trim()}`);
+    serverOutputBuffer = (serverOutputBuffer + text).slice(-4000);
+    const parsedUrl = parseServerUrl(serverOutputBuffer);
+    if (parsedUrl) {
+      if (port === null) port = Number(parsedUrl.port);
+      if (!lastServerUrl || parsedUrl.searchParams.has("token")) lastServerUrl = parsedUrl;
+    }
+    const safeText = redactServerAuth(text);
+    log(`[server] ${safeText.trim()}`);
     if (verbose) {
-      for (const rawLine of text.split(/\r?\n/)) {
+      for (const rawLine of safeText.split(/\r?\n/)) {
         const line = rawLine.replace(/\r/g, "").trim();
         if (line) sendBootLog(win, line);
       }
     }
-    const m = text.match(urlLine);
-    if (m && port === null) port = Number(m[1]);
   });
   child.stderr.on("data", (chunk) => {
     const text = chunk.toString();
     markActive();
     startupStderr = (startupStderr + text).slice(-8000);
-    log(`[server:err] ${text.trim()}`);
+    const safeText = redactServerAuth(text);
+    log(`[server:err] ${safeText.trim()}`);
     if (verbose) {
-      for (const rawLine of text.split(/\r?\n/)) {
+      for (const rawLine of safeText.split(/\r?\n/)) {
         const line = rawLine.replace(/\r/g, "").trim();
         if (line) sendBootLog(win, line);
       }
@@ -1750,6 +1803,7 @@ async function startServer(win, options = {}) {
   child.on("exit", (code, signal) => {
     stopStallTimer();
     log(`server exited code=${code} signal=${signal} quitting=${quitting} stopping=${serverStopping}`);
+    if (spawnError) return;
     if (!quitting && !serverStopping) {
       if (uiFlow) {
         sendBootLog(win, `DeepSeek Harness 启动失败（退出码 ${code ?? "unknown"}）`);
@@ -1771,18 +1825,19 @@ async function startServer(win, options = {}) {
     }
   });
 
-  // 等待就绪：优先解析 stdout 端口，再轮询 HTTP 200
+  // 等待就绪：dsh 已打印可用 URL 后，只确认本机端口正在监听。
+  // 不再把 token 认证、重定向或页面状态码当作安装成功条件。
   const deadline = Date.now() + (verbose ? DSH_INSTALL_READY_TIMEOUT_MS : SERVER_READY_TIMEOUT_MS);
   while (Date.now() < deadline) {
     if (port !== null) {
-      const ok = await probeHttp(port);
+      const ok = await probeLocalPort(port);
       if (ok) {
         stopStallTimer();
         sendBoot(win, { page: statusPage, installing: verbose, stage: verbose ? "全局安装完成，正在加载界面…" : "服务已就绪，正在加载界面…", percent: 100 });
         return port;
       }
     }
-    if (child.exitCode !== null) break;
+    if (spawnError || child.exitCode !== null) break;
     await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
   }
 
@@ -1792,7 +1847,9 @@ async function startServer(win, options = {}) {
     serverStopping = true;
     killServerTree();
     const reason =
-      port === null
+      spawnError
+        ? `服务器启动失败：${redactServerAuth(spawnError.message)}`
+        : port === null
         ? `${verbose ? "安装" : "启动"}超时，未能获得监听端口。`
         : `服务就绪超时（http://127.0.0.1:${port} 无响应）。`;
     sendBootLog(win, reason);
@@ -1837,7 +1894,9 @@ async function startServer(win, options = {}) {
   }
 
   const reason =
-    port === null
+    spawnError
+      ? `服务器启动失败：${redactServerAuth(spawnError.message)}`
+      : port === null
       ? "服务器启动超时，未能获得监听端口。"
       : `服务器就绪超时（http://127.0.0.1:${port} 无响应）。`;
   dialog.showErrorBox(APP_NAME, `${reason}\n日志：${logPath}`);
@@ -1932,6 +1991,35 @@ async function fetchChannelVersion(registry, tag) {
     log(`registry ${registry} ${tag} failed: ${err.message}`);
   }
   return null;
+}
+
+/** Remove process-local dsh URL tokens before writing output to logs/UI. */
+function redactServerAuth(text) {
+  return String(text).replace(
+    /https?:\/\/(?:127\.0\.0\.1|localhost):\d+(?:\/[^\s)]*)?/gi,
+    (raw) => raw.replace(/([?&]token=)[^&\s)]*/i, "$1<redacted>")
+  );
+}
+
+/** Parse the complete local dsh URL, including its optional authentication query. */
+function parseServerUrl(text) {
+  const match = String(text).match(/https?:\/\/(?:127\.0\.0\.1|localhost):\d+(?:\/[^\s)]*)?/i);
+  if (!match) return null;
+  try {
+    const url = new URL(match[0]);
+    if (url.hostname !== "127.0.0.1" && url.hostname !== "localhost") return null;
+    return url;
+  } catch {
+    return null;
+  }
+}
+
+/** Use the authenticated URL when dsh supplied one, otherwise keep old-version behavior. */
+function readyServerUrl(port) {
+  try {
+    if (lastServerUrl && Number(lastServerUrl.port) === Number(port)) return lastServerUrl.href;
+  } catch { /* fall through to the clean URL */ }
+  return `http://127.0.0.1:${port}`;
 }
 
 /** 查询单个更新频道的 npm dist-tag 版本。 */
@@ -2218,7 +2306,7 @@ async function installVersionWithSplash(win, version, channel = appSettings.upda
       if (newPort !== null) {
         dshLaunchVersion = version;
         saveBootChoice(currentBootChoice(dshLaunchVersion));
-        pendingBootUrl = `http://127.0.0.1:${newPort}`;
+        pendingBootUrl = readyServerUrl(newPort);
         cleanupManagedDshBackup(installResult);
         // 版本切换后刷新 dsh 命令行（启动器指向当前 dsh 版本）
         ensureDshCliOnPath().catch((err) => log(`ensure dsh cli after update failed: ${err.message}`));
@@ -2231,7 +2319,7 @@ async function installVersionWithSplash(win, version, channel = appSettings.upda
         }
         return;
       }
-      // 服务启动失败：尝试恢复旧版本
+      // 新版本服务启动失败：恢复旧版本文件，但不要自动启动旧服务。
       const restoredFiles = restoreManagedDshBackup(installResult);
       if (restoredFiles) {
         dshLaunchVersion = current;
@@ -2239,56 +2327,25 @@ async function installVersionWithSplash(win, version, channel = appSettings.upda
       }
     }
 
-    // 4) 取消 / 安装失败：恢复旧版本并重启旧服务。
-    // 失败时停留在启动页，明确展示失败结果；由用户点击“返回软件”进入主界面。
+    // 4) 取消 / 安装失败：只恢复旧版本文件，停留在安装失败页。
+    // 用户点击“返回软件”后回到启动页，再由用户决定是否启动旧版本。
     if (!cancelInstallRequested) sendBootLog(win, "DeepSeek Harness 安装失败，正在恢复旧版本…");
     const restoredFiles = restoreManagedDshBackup(installResult);
     if (restoredFiles) {
       dshLaunchVersion = current;
       sendBootLog(win, "已恢复更新前的 DeepSeek Harness 版本");
     }
-    let restoredPort = null;
-    try {
-      setRuntimeMode(previousMode);
-      restoredPort = await startServer(win, { readyBeforeLoad: true });
-    } catch { /* ignore */ }
-    if (restoredPort !== null) {
-      pendingBootUrl = `http://127.0.0.1:${restoredPort}`;
-      if (cancelInstallRequested) {
-        sendBootLog(win, "已取消安装，旧版本服务已恢复，正在返回软件");
-        await delay(500);
-        if (!win.isDestroyed()) {
-          const target = pendingBootUrl;
-          pendingBootUrl = null;
-          win.loadURL(target);
-        }
-        return;
-      }
-      sendBootLog(win, cancelInstallRequested
-        ? "已取消安装，旧版本服务已恢复，请点击“返回软件”"
-        : "安装失败，旧版本服务已恢复，请点击“返回软件”");
-      sendBoot(win, {
-        page: "installing",
-        installing: false,
-        installError: true,
-        stage: cancelInstallRequested
-          ? "安装已取消，旧版本已恢复，请点击返回软件"
-          : "安装失败，旧版本已恢复，请点击返回软件",
-        percent: 0,
-        installMode: "global",
-      });
-      return;
-    }
-    // 服务未能恢复：停留在安装视图并提示（提供返回按钮由渲染层触发 dsh:return-to-app）
+    setRuntimeMode(previousMode);
     sendBoot(win, {
       page: "installing",
       installing: false,
       installError: true,
       stage: cancelInstallRequested
-        ? "安装已取消，正在恢复旧版本，请稍后重试或重启软件"
-        : "安装失败，旧版本服务未能恢复，请重启软件",
+        ? "安装已取消，旧版本已恢复，请点击返回软件"
+        : "安装失败，旧版本已恢复，请点击返回软件",
       percent: 0,
       installMode: "global",
+      showReturnApp: true,
     });
   } finally {
     updating = false;
@@ -2378,7 +2435,7 @@ async function performUpdate(win, { silent = false } = {}) {
       if (newPort !== null) {
         dshLaunchVersion = latest.version;
         saveBootChoice(currentBootChoice(dshLaunchVersion));
-        pendingBootUrl = `http://127.0.0.1:${newPort}`;
+        pendingBootUrl = readyServerUrl(newPort);
         cleanupManagedDshBackup(installResult);
         break;
       }
@@ -2387,41 +2444,27 @@ async function performUpdate(win, { silent = false } = {}) {
         dshLaunchVersion = current;
         sendBootLog(win, "已恢复更新前的 DeepSeek Harness 版本");
       }
-      // 失败：用旧版本重启服务器，恢复可用状态；弹窗提示（不刷新页面，避免丢失弹窗）
-      let restoredPort = null;
-      try {
-        setRuntimeMode(previousMode);
-        restoredPort = await startServer(win, { readyBeforeLoad: true });
-      } catch { /* ignore */ }
-      const recovered = restoredPort !== null;
-      if (recovered) {
-        pendingBootUrl = `http://127.0.0.1:${restoredPort}`;
-        sendBootLog(win, "旧版本服务已重新启动");
-      }
-      sendStatus(win, { state: "idle", current });
-      sendEvent(win, {
-        type: "update-failed",
-        current,
-        latest: latest.version,
-        channel: latest.channel,
-        channels: channelVersions,
-        restored: recovered,
-        detail: recovered
-          ? "通过 npm 安装 DeepSeek Harness 失败，已恢复旧版本运行。"
-          : "通过 npm 安装 DeepSeek Harness 失败，旧版本服务未能重新启动，请检查日志。",
-      });
-      const action = await waitForUpdateAction(win);
-      if (action !== "retry") {
-        sendEvent(win, { type: "close" });
-        // 关闭后刷新页面，重新连接已恢复的服务器
-        if (!win.isDestroyed()) {
-          const target = pendingBootUrl || win.webContents.getURL();
-          pendingBootUrl = null;
-          win.loadURL(target);
-        }
-        return;
-      }
+      // 失败：只恢复旧版本文件，直接显示安装失败页；不自动启动旧服务。
+      setRuntimeMode(previousMode);
       pendingBootUrl = null;
+      sendStatus(win, { state: "idle", current });
+      const splashUrl = pathToFileURL(path.join(__dirname, "assets", "splash.html")).href;
+      bootPayloadCache.delete(win);
+      if (!win.isDestroyed()) win.loadURL(splashUrl);
+      await delay(300);
+      if (!win.isDestroyed()) {
+        sendBootLog(win, "DeepSeek Harness 安装失败，旧版本已恢复，请点击返回软件");
+        sendBoot(win, {
+          page: "installing",
+          installing: false,
+          installError: true,
+          stage: "安装失败，旧版本已恢复，请点击返回软件",
+          percent: 0,
+          installMode: "global",
+          showReturnApp: true,
+        });
+      }
+      return;
     }
 
     // ---- 成功：新版已安装并拉起服务，无需重启整个应用 ----
@@ -2528,6 +2571,44 @@ function createWindow(url, savedBoot = null) {
 
   win.loadURL(url);
   return win;
+}
+
+/** Return from an installation failure to the local startup screen. */
+async function returnToStartupScreen(win) {
+  if (!win || win.isDestroyed()) return false;
+  pendingBootUrl = null;
+  lastServerUrl = null;
+  const splashUrl = pathToFileURL(path.join(__dirname, "assets", "splash.html")).href;
+  bootPayloadCache.delete(win);
+  win.loadURL(splashUrl);
+  await delay(300);
+  if (win.isDestroyed()) return false;
+  const dshProbe = probeManagedDshRuntime();
+  const nativeOk = !!(nativeRuntime && nativeRuntime.localNodeReady);
+  const portableOk = hasHealthyAppRuntime();
+  const bootable = dshProbe.ready && ((runtimeMode === "global" || runtimeMode === "native") ? (nativeOk || portableOk) : portableOk);
+  if (bootable) {
+    sendBoot(win, {
+      page: "ready",
+      stage: "旧版本已恢复，点击开始使用",
+      percent: 100,
+      primaryAction: "start",
+      installMode: runtimeMode,
+      detectComplete: true,
+    });
+  } else {
+    sendBoot(win, {
+      page: "detect",
+      stage: "请检查运行环境后重试",
+      percent: 0,
+      native: nativeRuntime,
+      dshCache: dshProbe,
+      detectComplete: true,
+      nextPage: "location",
+      installMode: runtimeMode,
+    });
+  }
+  return true;
 }
 
 // ---------- IPC ----------
@@ -2650,8 +2731,7 @@ function registerIpc() {
       win.loadURL(target);
       return { ok: true };
     }
-    // 无可用服务：回到启动页默认状态（由渲染层展示提示）
-    return { ok: false };
+    return { ok: await returnToStartupScreen(win) };
   });
   ipcMain.handle("dsh:reload-after-update", async (event) => {
     const win = BrowserWindow.fromWebContents(event.sender);
@@ -2948,7 +3028,7 @@ async function bootServer(win, options = {}) {
   const port = await startServer(win, options);
   if (port === null) return;
   if (options.readyBeforeLoad) {
-    pendingBootUrl = `http://127.0.0.1:${port}`;
+    pendingBootUrl = readyServerUrl(port);
     sendBoot(win, {
       page: "ready",
       stage: readyStageText(runtimeMode),
@@ -2959,8 +3039,8 @@ async function bootServer(win, options = {}) {
     });
     return;
   }
-  const url = `http://127.0.0.1:${port}`;
-  log(`GUI ready at ${url}`);
+  const url = readyServerUrl(port);
+  log(`GUI ready at ${redactServerAuth(url)}`);
   // 启动画面 → 主界面：导航时保持主题实色底，避免页面首帧白闪；
   // 页面渲染出主题底色后（dsh:theme 上报）再由主进程恢复毛玻璃透明底。
   win.loadURL(url);
