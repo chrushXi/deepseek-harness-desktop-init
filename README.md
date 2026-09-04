@@ -5,6 +5,9 @@ DeepSeekHarness的桌面版，兼容有或者没有Harness的用户，并且    
 > 界面即官方 `dsh --profile web` 前端，功能与网页版完全一致；本应用只是把「Node 运行时 + dsh + 前端」打包成一个桌面程序，并加上原生窗口与增强插件。
 
 ---
+## 反馈群组
+<img width="1284" height="2280" alt="qrcode_1788538949586" src="https://github.com/user-attachments/assets/0824ef8c-3bf6-4dc1-a634-c78cbbd4e416" />
+
 ## 下载与发布（GitHub Releases）
 
 - [前往Release下载](https://github.com/chrushXi/deepseek-harness-desktop-init/releases)
