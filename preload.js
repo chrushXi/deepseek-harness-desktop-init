@@ -585,7 +585,9 @@ function injectTitlebar() {
     if (balanceRenderTimer !== null) return;
     balanceRenderTimer = setTimeout(() => {
       balanceRenderTimer = null;
-      renderBalance(balanceRenderMode);
+      const mode = balanceRenderMode;
+      balanceRenderMode = "none";
+      renderBalance(mode);
     }, 60);
   };
   const setReceiptVisibility = () => {
@@ -657,7 +659,9 @@ function injectTitlebar() {
       scheduleBalanceRender("reel");
       panelGranted.textContent = fmtMoney(Number(data.grantedBalance) || 0);
       balance.title = `DeepSeek 账户余额：${fmtMoney(next)}${data.grantedBalance > 0 ? `，赠送 ${fmtMoney(data.grantedBalance)}` : ""}`;
-      if (Math.abs(remoteDelta) > 1e-9) showDelta({ cost: Math.abs(remoteDelta), damageKind: "normal" }, remoteDelta > 0 ? "+" : "-");
+      // 扣减飘字只由 charge-events 驱动，避免与 pendingCost 轮询双闪；
+      // 官方余额上升（充值/落账回补）仍在这里提示。
+      if (remoteDelta > 1e-9) showDelta({ cost: remoteDelta, damageKind: "normal" }, "+");
     } catch { /* keep the last known titlebar value */ }
   };
   void pollBalance();
@@ -804,6 +808,7 @@ function attachPricingForm(root) {
   const priceStatus = root.querySelector("#dsh-tb-price-status");
   const priceReset = root.querySelector("#dsh-tb-price-reset");
   const priceSave = root.querySelector("#dsh-tb-price-save");
+  const usageScopeWrap = root.querySelector("#dsh-tb-usage-scope");
   const priceInputs = Array.from(root.querySelectorAll(".dsh-tb-price-input:not(.dsh-tb-time-input)"));
   const weekdayWrap = root.querySelector("#dsh-tb-price-weekdays");
   const segmentWrap = root.querySelector("#dsh-tb-price-segments");
@@ -913,6 +918,22 @@ function attachPricingForm(root) {
     renderWeekdays();
     renderSegments();
   };
+  const setUsageScopeUi = (scope) => {
+    if (!usageScopeWrap) return;
+    const next = scope === "deepseek" || scope === "local" || scope === "both" ? scope : "both";
+    usageScopeWrap.dataset.scope = next;
+    usageScopeWrap.querySelectorAll(".dsh-set-seg-btn").forEach((btn) => {
+      btn.classList.toggle("dsh-set-seg-on", btn.dataset.scope === next);
+    });
+  };
+  const loadUsageScope = async () => {
+    try {
+      const res = await fetch("/api/token-monitor/usage-scope", { cache: "no-store" });
+      if (!res.ok) return;
+      const data = await res.json();
+      setUsageScopeUi(data && data.usageScope);
+    } catch { /* host may not be ready */ }
+  };
   /** 读取表单：价格 + 星期 + 时段，返回可保存的完整价格表。 */
   const readPriceForm = () => {
     ensurePriceTable();
@@ -966,6 +987,29 @@ function attachPricingForm(root) {
     });
   }
   if (priceModel) priceModel.addEventListener("change", () => renderPriceForm());
+  if (usageScopeWrap) {
+    usageScopeWrap.querySelectorAll(".dsh-set-seg-btn").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const scope = btn.dataset.scope;
+        try {
+          setPriceStatus("保存中");
+          const res = await fetch("/api/token-monitor/usage-scope", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ usageScope: scope }),
+            cache: "no-store",
+          });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const data = await res.json();
+          setUsageScopeUi(data && data.usageScope);
+          setPriceStatus("记录范围已保存", { ok: true });
+        } catch {
+          setPriceStatus("保存失败", { err: true });
+        }
+      });
+    });
+    void loadUsageScope();
+  }
   if (addSegmentBtn) {
     addSegmentBtn.addEventListener("click", () => {
       ensurePriceTable();
@@ -1008,6 +1052,7 @@ function attachPricingForm(root) {
   const refresh = async () => {
     await loadPricingTable();
     renderPriceForm();
+    await loadUsageScope();
     setPriceStatus("已读取");
   };
   void refresh();
@@ -1112,6 +1157,25 @@ const SETTINGS_DIALOG_CSS = `
 }
 .dsh-set-seg[data-channel="next"] .dsh-set-seg-pill { transform: translateX(100%); }
 .dsh-set-seg[data-channel="alpha"] .dsh-set-seg-pill { transform: translateX(200%); }
+.dsh-tb-usage-scope-seg {
+  margin-top: 6px;
+  display: flex;
+  width: 100%;
+  max-width: 360px;
+}
+/* 字宽不等，不用滑动药丸，避免底条盖住邻项文字 */
+.dsh-tb-usage-scope-seg .dsh-set-seg-pill { display: none; }
+.dsh-tb-usage-scope-seg .dsh-set-seg-btn {
+  flex: 1 1 0;
+  min-width: 0;
+  padding: 5px 10px;
+  white-space: nowrap;
+}
+.dsh-tb-usage-scope-seg .dsh-set-seg-btn.dsh-set-seg-on {
+  background: var(--dsh-set-accent);
+  color: #fff;
+  box-shadow: 0 2px 6px rgba(77,107,254,.35);
+}
 .dsh-set-seg-btn {
   -webkit-app-region: no-drag;
   appearance: none; border: none; cursor: pointer;
@@ -1595,6 +1659,12 @@ const PRICING_FORM_HTML = `
   <div class="dsh-tb-price-peak-title">峰谷时段（自定义，结束 00:00 表示次日零点）</div>
   <div class="dsh-tb-price-segments" id="dsh-tb-price-segments"></div>
   <button class="dsh-tb-price-add" id="dsh-tb-price-add" type="button">添加时段</button>
+  <div class="dsh-tb-price-peak-title">用量记录范围（账户余额始终只按 DeepSeek 扣减）</div>
+  <div class="dsh-set-seg dsh-tb-usage-scope-seg" id="dsh-tb-usage-scope" data-scope="both">
+    <button class="dsh-set-seg-btn" data-scope="deepseek" type="button" title="只记录 DeepSeek 官方调用">仅 DeepSeek</button>
+    <button class="dsh-set-seg-btn" data-scope="local" type="button" title="只记录本地模型（llama 等），不扣官方余额">仅本地</button>
+    <button class="dsh-set-seg-btn dsh-set-seg-on" data-scope="both" type="button" title="本地与 DeepSeek 都记入明细/小票">两者</button>
+  </div>
   <div class="dsh-tb-price-actions">
     <span class="dsh-tb-price-status" id="dsh-tb-price-status">读取中</span>
     <span class="dsh-tb-price-buttons">

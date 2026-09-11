@@ -14,10 +14,51 @@ let lastActiveSessionId = null;
 * 官方值一旦变化（扣费落账或充值），锚点前移，不再重复扣减。
 */
 let lastOfficialChangeTs = null;
+/** 上次成功拉到的官方 totalBalance：重启后首次 refresh 用它对比，避免跳过锚点校准。 */
+let lastOfficialTotal = null;
+/** 用量记录范围：deepseek=仅官方 / local=仅本地 / both=两者。余额待扣始终只计 DeepSeek。 */
+let usageScope = "both";
 const BALANCE_ANCHOR_FILE = () => join(DATA_DIR, "balance-anchor.json");
+const USAGE_SCOPE_FILE = () => join(DATA_DIR, "usage-scope.json");
+/** 是否计入 DeepSeek 账户余额（官方 API / deepseek 型号名；路径型 model 视为本地）。 */
+function isDeepSeekBilling(provider, model) {
+	const p = typeof provider === "string" ? provider : "";
+	const m = typeof model === "string" ? model : "";
+	if (p === "deepseek-official" || p === "deepseek") return true;
+	if (m.startsWith("deepseek") && !/[/\\]/.test(m)) return true;
+	return false;
+}
+function normalizeUsageScope(value) {
+	if (value === "deepseek" || value === "local" || value === "both") return value;
+	return "both";
+}
+function loadUsageScope() {
+	try {
+		const parsed = JSON.parse(readFileSync(USAGE_SCOPE_FILE(), "utf8"));
+		return normalizeUsageScope(parsed?.usageScope);
+	} catch {
+		return "both";
+	}
+}
+function saveUsageScope(next) {
+	try {
+		mkdirSync(DATA_DIR, { recursive: true });
+		writeFileSync(USAGE_SCOPE_FILE(), `${JSON.stringify({ usageScope: next }, null, 2)}\n`, "utf8");
+	} catch { /* 落盘失败不影响内存 */ }
+}
+/** 是否写入用量明细/小票（按记录范围）；与余额待扣无关。 */
+function inUsageScope(provider, model) {
+	const isDs = isDeepSeekBilling(provider, model);
+	if (usageScope === "deepseek") return isDs;
+	if (usageScope === "local") return !isDs;
+	return true;
+}
 function loadBalanceAnchor() {
 	try {
 		const parsed = JSON.parse(readFileSync(BALANCE_ANCHOR_FILE(), "utf8"));
+		if (typeof parsed.lastOfficialTotal === "number" && Number.isFinite(parsed.lastOfficialTotal)) {
+			lastOfficialTotal = parsed.lastOfficialTotal;
+		}
 		if (typeof parsed.lastOfficialChangeTs === "number" && Number.isFinite(parsed.lastOfficialChangeTs)) return parsed.lastOfficialChangeTs;
 	} catch { /* 首次运行/文件缺失 */ }
 	return null;
@@ -25,14 +66,15 @@ function loadBalanceAnchor() {
 function saveBalanceAnchor() {
 	try {
 		mkdirSync(DATA_DIR, { recursive: true });
-		writeFileSync(BALANCE_ANCHOR_FILE(), `${JSON.stringify({ lastOfficialChangeTs }, null, 2)}\n`, "utf8");
+		writeFileSync(BALANCE_ANCHOR_FILE(), `${JSON.stringify({ lastOfficialChangeTs, lastOfficialTotal }, null, 2)}\n`, "utf8");
 	} catch { /* 落盘失败不影响内存计算 */ }
 }
-/** 官方尚未反映的本地扣费合计：锚点之后的全部用量明细金额。 */
+/** 官方尚未反映的 DeepSeek 扣费合计：锚点之后、且属于官方计费的明细。本地模型不进待扣。 */
 function pendingDeduction(storage) {
 	if (lastOfficialChangeTs === null) return 0;
 	let cost = 0;
 	for (const record of storage.history()) {
+		if (!isDeepSeekBilling(record.provider, record.model)) continue;
 		if (Number.isFinite(record.timestamp) && record.timestamp > lastOfficialChangeTs) cost += record.cost ?? 0;
 	}
 	return cost;
@@ -297,23 +339,28 @@ function attachCollector(ctx, storage, priceTable) {
 		if (usage === void 0) return;
 		const source = event.data.message.source;
 		if (source.kind !== "model") return;
+		// 记录范围：deepseek / local / both。余额待扣只由 isDeepSeekBilling 决定。
+		if (!inUsageScope(source.provider, source.model)) return;
 		const record = buildRecord(session.id, event.data.turn, event.data.step, event.time, source.provider, source.model, usage, priceTable);
 		storage.add(record);
-		const damageKind = record.inputTokens > 0 || record.cacheWriteTokens > 0 ? "miss" : "normal";
-		recordCharge(record.cost, record.timestamp, damageKind, {
-			cacheHit: {
-				tokens: record.cacheReadTokens,
-				cost: record.costCacheRead
-			},
-			cacheMiss: {
-				tokens: record.inputTokens + record.cacheWriteTokens,
-				cost: record.costInput + record.costCacheWrite
-			},
-			output: {
-				tokens: record.outputTokens,
-				cost: record.costOutput
-			}
-		});
+		// 仅 DeepSeek 官方扣费进入 charge-events（驱动余额飘字）；本地只记明细。
+		if (isDeepSeekBilling(source.provider, source.model)) {
+			const damageKind = record.inputTokens > 0 || record.cacheWriteTokens > 0 ? "miss" : "normal";
+			recordCharge(record.cost, record.timestamp, damageKind, {
+				cacheHit: {
+					tokens: record.cacheReadTokens,
+					cost: record.costCacheRead
+				},
+				cacheMiss: {
+					tokens: record.inputTokens + record.cacheWriteTokens,
+					cost: record.costInput + record.costCacheWrite
+				},
+				output: {
+					tokens: record.outputTokens,
+					cost: record.costOutput
+				}
+			});
+		}
 		session.append("token-usage/record", { record });
 	});
 }
@@ -406,14 +453,16 @@ var BalanceService = class {
 		}
 		try {
 			const next = await fetchBalance(apiKey);
-			const prev = this.latest?.totalBalance;
+			// 内存缓存优先；重启后用持久化的上次官方值，避免首次 refresh 跳过锚点校准。
+			const prev = this.latest?.totalBalance ?? lastOfficialTotal;
 			// 官方余额值发生变化：说明其已反映此前的扣费（或发生充值），
 			// 重置本地待扣锚点 —— 新值之后的扣费才需要本地补扣。
-			if (prev !== void 0 && Math.abs(next.totalBalance - prev) > 1e-9) {
+			if (prev !== void 0 && prev !== null && Math.abs(next.totalBalance - prev) > 1e-9) {
 				lastOfficialChangeTs = Date.now();
-				saveBalanceAnchor();
 			}
+			lastOfficialTotal = next.totalBalance;
 			this.latest = next;
+			saveBalanceAnchor();
 			if (this.lastLoggedTotal !== next.totalBalance) {
 				this.lastLoggedTotal = next.totalBalance;
 				console.log(`[dsh-damage-pulse] 余额 ${next.currency} ${next.totalBalance.toFixed(2)} (赠送 ${next.grantedBalance.toFixed(2)} / 充值 ${next.toppedUpBalance.toFixed(2)})`);
@@ -764,6 +813,8 @@ function buildSessionReceipt(sessionId, records, createdAt, llmMs) {
 }
 function apply(ctx) {
 	console.log("[dsh-damage-pulse] plugin loaded");
+	usageScope = loadUsageScope();
+	console.log(`[dsh-damage-pulse] 用量记录范围: ${usageScope}`);
 	const priceTable = cloneJson(PRICE_TABLE);
 	ctx.inject(["settings"], (settingsCtx) => {
 		const section = settingsCtx.settings.register(SETTINGS_NS, settingsSchema).get();
@@ -796,6 +847,29 @@ function apply(ctx) {
 	ctx.inject(["webServer"], (webCtx) => {
 		registerBalanceRoute(webCtx, balance, storage);
 		console.log("[dsh-damage-pulse] balance route registered");
+		webCtx.webServer.register({
+			kind: "exact",
+			path: "/api/token-monitor/usage-scope",
+			handler: (req, res) => {
+				if (req.method === "GET" || req.method === void 0) {
+					sendJson(res, 200, { usageScope });
+					return;
+				}
+				if (req.method !== "POST") {
+					sendJson(res, 405, { error: "method not allowed" });
+					return;
+				}
+				void readRequestJson(req).then((body) => {
+					usageScope = normalizeUsageScope(body?.usageScope);
+					saveUsageScope(usageScope);
+					sendJson(res, 200, { usageScope });
+					console.log(`[dsh-damage-pulse] 用量记录范围已更新: ${usageScope}`);
+				}).catch((error) => {
+					sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+				});
+			}
+		});
+		console.log("[dsh-damage-pulse] usage-scope route registered");
 		webCtx.webServer.register({
 			kind: "exact",
 			path: "/api/token-monitor/usage",
