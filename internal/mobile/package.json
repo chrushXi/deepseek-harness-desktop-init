@@ -1,0 +1,8 @@
+{
+  "name": "dsh-mobile-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DeepSeek Harness 局域网手机连接桥（状态同屏）",
+  "main": "bridge.js",
+  "type": "commonjs"
+}

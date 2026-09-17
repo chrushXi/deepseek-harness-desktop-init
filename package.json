@@ -1,7 +1,7 @@
 {
   "name": "deepseek-harness-desktop",
   "productName": "DeepSeek Harness",
-  "version": "0.2.9",
+  "version": "0.2.10",
   "description": "DeepSeek Harness 桌面版",
   "main": "main.js",
   "author": "MaoBai c.d",
@@ -34,6 +34,10 @@
       {
         "from": "internal/damage-pulse",
         "to": "internal/damage-pulse"
+      },
+      {
+        "from": "internal/reasoning-effort",
+        "to": "internal/reasoning-effort"
       }
     ],
     "win": {

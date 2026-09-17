@@ -804,11 +804,17 @@ async function loadPricingTable() {
 
 /** 在指定容器内绑定计费设置表单（模型 / 价格 / 峰谷日期 / 峰谷时段 / 默认 / 保存）。 */
 function attachPricingForm(root) {
-  const priceModel = root.querySelector("#dsh-tb-price-model");
+  const priceModelSelect = root.querySelector("#dsh-tb-price-model-select");
+  const priceModelTrigger = root.querySelector("#dsh-tb-price-model-trigger");
+  const priceModelTriggerText = root.querySelector("#dsh-tb-price-model-trigger-text");
+  const priceModelMenu = root.querySelector("#dsh-tb-price-model-menu");
   const priceStatus = root.querySelector("#dsh-tb-price-status");
   const priceReset = root.querySelector("#dsh-tb-price-reset");
   const priceSave = root.querySelector("#dsh-tb-price-save");
   const usageScopeWrap = root.querySelector("#dsh-tb-usage-scope");
+  /** 官方 catalog：[{id, name}]，value/计费用 id，展示用 name。 */
+  let officialModels = [];
+  let selectedPriceModel = "deepseek-v4-flash";
   const priceInputs = Array.from(root.querySelectorAll(".dsh-tb-price-input:not(.dsh-tb-time-input)"));
   const weekdayWrap = root.querySelector("#dsh-tb-price-weekdays");
   const segmentWrap = root.querySelector("#dsh-tb-price-segments");
@@ -816,7 +822,42 @@ function attachPricingForm(root) {
   const WEEKDAY_LABELS = ["一", "二", "三", "四", "五", "六", "日"];
   let priceStatusTimer = null;
 
-  const activePriceModel = () => (priceModel && priceModel.value ? priceModel.value : "deepseek-v4-flash");
+  const activePriceModel = () => selectedPriceModel || "deepseek-v4-flash";
+  const modelDisplayName = (id) => {
+    const hit = officialModels.find((m) => m.id === id);
+    return (hit && hit.name) || id;
+  };
+  /** 价格表缺该模型时，用 flash 默认价播种，避免读到 undefined。 */
+  const ensureModelRates = (modelId) => {
+    ensurePriceTable();
+    if (!priceTable.models) priceTable.models = {};
+    if (!priceTable.models[modelId]) {
+      priceTable.models[modelId] = clonePriceTable(DEFAULT_PRICE_TABLE.models["deepseek-v4-flash"]);
+    }
+    return priceTable.models[modelId];
+  };
+  const closePriceModelMenu = () => {
+    if (!priceModelSelect || !priceModelTrigger) return;
+    priceModelSelect.classList.remove("dsh-llama-preset-open");
+    priceModelTrigger.setAttribute("aria-expanded", "false");
+  };
+  const renderPriceModelMenu = () => {
+    if (!priceModelMenu) return;
+    const models = officialModels.length > 0
+      ? officialModels
+      : [{ id: "deepseek-v4-flash", name: "DeepSeek-V4-Flash" }, { id: "deepseek-v4-pro", name: "DeepSeek-V4-Pro" }];
+    if (!models.some((m) => m.id === selectedPriceModel)) selectedPriceModel = models[0].id;
+    priceModelMenu.innerHTML = models.map((m) => {
+      const selected = m.id === selectedPriceModel;
+      const label = m.name || m.id;
+      return `<button class="dsh-llama-preset-option${selected ? " dsh-llama-preset-option-on" : ""}" type="button" role="option" aria-selected="${selected}" data-model-id="${escAttr(m.id)}" title="${escAttr(label)}"><span class="dsh-llama-preset-text"><span class="dsh-llama-preset-text-inner">${escHtml(label)}</span></span></button>`;
+    }).join("");
+    if (priceModelTriggerText) {
+      const label = modelDisplayName(selectedPriceModel);
+      priceModelTriggerText.textContent = label;
+      priceModelTriggerText.title = label;
+    }
+  };
   const setPriceStatus = (text, opts = {}) => {
     if (!priceStatus) return;
     priceStatus.textContent = text;
@@ -909,12 +950,14 @@ function attachPricingForm(root) {
   const renderPriceForm = () => {
     ensurePriceTable();
     const model = activePriceModel();
-    const modelTable = (priceTable.models && priceTable.models[model]) || DEFAULT_PRICE_TABLE.models[model];
+    ensureModelRates(model);
+    const modelTable = (priceTable.models && priceTable.models[model]) || DEFAULT_PRICE_TABLE.models["deepseek-v4-flash"];
     for (const input of priceInputs) {
       const scope = input.dataset.rateScope;
       const key = input.dataset.rateKey;
       input.value = String(modelTable[scope][key]);
     }
+    renderPriceModelMenu();
     renderWeekdays();
     renderSegments();
   };
@@ -938,12 +981,13 @@ function attachPricingForm(root) {
   const readPriceForm = () => {
     ensurePriceTable();
     const model = activePriceModel();
+    const rates = ensureModelRates(model);
     for (const input of priceInputs) {
       const scope = input.dataset.rateScope;
       const key = input.dataset.rateKey;
       const value = Number(input.value.trim());
       if (!Number.isFinite(value) || value < 0) throw new Error("价格必须是非负数字");
-      priceTable.models[model][scope][key] = value;
+      rates[scope][key] = value;
     }
     // 星期：读取当前圆圈激活态（不要求至少一天，全关=全天谷价）
     priceTable.weekdays = Array.from(weekdayWrap.querySelectorAll(".dsh-tb-price-day.dsh-tb-price-day-on"))
@@ -983,10 +1027,32 @@ function attachPricingForm(root) {
       ensurePriceTable();
       const value = Number(input.value.trim());
       if (!Number.isFinite(value) || value < 0) return;
-      priceTable.models[activePriceModel()][input.dataset.rateScope][input.dataset.rateKey] = value;
+      ensureModelRates(activePriceModel())[input.dataset.rateScope][input.dataset.rateKey] = value;
     });
   }
-  if (priceModel) priceModel.addEventListener("change", () => renderPriceForm());
+  if (priceModelTrigger && priceModelSelect) {
+    priceModelTrigger.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const open = !priceModelSelect.classList.contains("dsh-llama-preset-open");
+      priceModelSelect.classList.toggle("dsh-llama-preset-open", open);
+      priceModelTrigger.setAttribute("aria-expanded", String(open));
+    });
+    if (priceModelMenu) {
+      priceModelMenu.addEventListener("click", (event) => {
+        const option = event.target.closest(".dsh-llama-preset-option");
+        if (!option) return;
+        const id = option.getAttribute("data-model-id");
+        if (!id) return;
+        selectedPriceModel = id;
+        closePriceModelMenu();
+        renderPriceForm();
+      });
+    }
+    document.addEventListener("pointerdown", (event) => {
+      if (priceModelSelect && !priceModelSelect.contains(event.target)) closePriceModelMenu();
+    });
+  }
   if (usageScopeWrap) {
     usageScopeWrap.querySelectorAll(".dsh-set-seg-btn").forEach((btn) => {
       btn.addEventListener("click", async () => {
@@ -1051,6 +1117,17 @@ function attachPricingForm(root) {
   }
   const refresh = async () => {
     await loadPricingTable();
+    try {
+      const res = await fetch("/api/token-monitor/models", { cache: "no-store" });
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data && data.models) && data.models.length > 0) {
+          officialModels = data.models
+            .map((m) => ({ id: String(m.id || "").trim(), name: String(m.name || m.id || "").trim() }))
+            .filter((m) => m.id !== "");
+        }
+      }
+    } catch { /* host may not be ready; keep fallback list */ }
     renderPriceForm();
     await loadUsageScope();
     setPriceStatus("已读取");
@@ -1069,6 +1146,8 @@ const SETTINGS_DIALOG_CSS = `
   background: rgba(8, 10, 16, 0.34);
   -webkit-backdrop-filter: blur(6px);
   backdrop-filter: blur(6px);
+  /* 让原生 time/select 控件跟随系统明暗，避免暗色界面弹出亮色选择器 */
+  color-scheme: light dark;
   /* 字体与 dsh 一致（页面已加载 DM Sans 等字体文件） */
   font-family: var(--ds-font-sans, "DM Sans", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif);
 }
@@ -1132,8 +1211,8 @@ const SETTINGS_DIALOG_CSS = `
   color: var(--dsh-set-accent);
   font-weight: 400;
 }
-.dsh-set-content { flex: 1; min-width: 0; padding: 16px 18px 26px; overflow-y: auto; display: flex; flex-direction: column; }
-.dsh-set-panel { display: none; flex-direction: column; min-height: 0; flex: 1; }
+.dsh-set-content { position: relative; flex: 1; min-width: 0; padding: 16px 20px 0; overflow-y: auto; display: flex; flex-direction: column; }
+.dsh-set-panel { display: none; flex-direction: column; min-height: 0; flex: 0 0 auto; padding-bottom: 36px; }
 .dsh-set-panel.dsh-set-panel-on { display: flex; }
 .dsh-set-panel-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 12px; }
 .dsh-set-panel-title { font-size: 15px; font-weight: 400; letter-spacing: .05em; }
@@ -1300,9 +1379,10 @@ const SETTINGS_DIALOG_CSS = `
 .dsh-set-section:hover { border-color: var(--dsw-alias-border-l2, rgba(128,128,128,.34)); }
 .dsh-set-section + .dsh-set-section { margin-top: 10px; }
 .dsh-set-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.dsh-set-section .dsh-set-row + .dsh-set-row { margin-top: 10px; }
 .dsh-set-row-text { min-width: 0; }
-.dsh-set-row-title { font-size: 13px; font-weight: 400; letter-spacing: .04em; }
-.dsh-set-row-sub { font-size: 11.5px; color: var(--dsw-alias-label-tertiary, #8a8f98); margin-top: 7px; letter-spacing: .01em; line-height: 1.5; }
+.dsh-set-row-title { font-size: 13px; font-weight: 400; letter-spacing: .04em; line-height: 1.35; }
+.dsh-set-row-sub { font-size: 11.5px; color: var(--dsw-alias-label-tertiary, #8a8f98); margin-top: 2px; letter-spacing: .01em; line-height: 1.4; }
 /* 开关：带弹性动效 */
 .dsh-set-switch { position: relative; display: inline-block; flex: none; width: 40px; height: 23px; }
 .dsh-set-switch input { position: absolute; opacity: 0; width: 100%; height: 100%; margin: 0; cursor: pointer; z-index: 2; }
@@ -1321,7 +1401,23 @@ const SETTINGS_DIALOG_CSS = `
 }
 .dsh-set-switch input:checked + .dsh-set-switch-track { background: var(--dsh-set-accent); }
 .dsh-set-switch input:checked + .dsh-set-switch-track::after { transform: translateX(17px); }
-/* 余额插件设置：白色可折叠表单（收起时仍可看到下方填写项预览） */
+.dsh-mobile-switch-control { display: inline-flex; align-items: center; gap: 8px; flex: none; }
+.dsh-mobile-switch-feedback {
+  min-width: 56px; text-align: right; color: var(--dsw-alias-label-tertiary, #8a8f98);
+  font-size: 11px; font-variant-numeric: tabular-nums;
+}
+.dsh-mobile-switch-feedback.dsh-mobile-switch-feedback-loading { color: var(--dsh-set-accent, #4d6bfe); }
+.dsh-mobile-switch-feedback.dsh-mobile-switch-feedback-ok { color: #34a853; }
+.dsh-mobile-switch-feedback.dsh-mobile-switch-feedback-error { color: #dc2626; }
+.dsh-set-switch.dsh-mobile-switch-loading input { cursor: wait; }
+.dsh-set-switch.dsh-mobile-switch-loading .dsh-set-switch-track::after {
+  background: transparent; border: 2px solid rgba(77,107,254,.25); border-top-color: var(--dsh-set-accent, #4d6bfe);
+  box-sizing: border-box; transform: translateX(8.5px);
+  animation: dsh-mobile-switch-spin .7s linear infinite;
+}
+.dsh-set-switch.dsh-mobile-switch-success .dsh-set-switch-track { background: #34a853; }
+@keyframes dsh-mobile-switch-spin { to { transform: translateX(8.5px) rotate(360deg); } }
+/* 余额插件设置：主题自适应可折叠表单（收起时仍可看到下方填写项预览） */
 .dsh-set-subsection { margin-top: 16px; }
 .dsh-set-subsection-head {
   -webkit-app-region: no-drag;
@@ -1356,41 +1452,58 @@ const SETTINGS_DIALOG_CSS = `
   transition: max-height .22s cubic-bezier(.2,.7,.3,1);
 }
 .dsh-set-subsection-body.dsh-set-subsection-open { max-height: 760px; }
-/* 白色表单卡片（紧凑：小号控件 + 宽松间距，避免挤压感） */
+/* 表单卡片：跟随宿主主题（暗色/浅色自适应） */
 .dsh-set-subsection-inner {
   margin-top: 8px;
   padding: 10px 12px;
-  background: #ffffff;
-  border: 1px solid #e3e7f0;
+  background: var(--dsw-alias-bg-module-platform, #171b24);
+  border: 1px solid var(--dsw-alias-border-l2, rgba(128,128,128,.28));
   border-radius: 10px;
-  box-shadow: 0 2px 10px rgba(15, 23, 42, .08);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, .12);
 }
 .dsh-tb-panel-muted { color: var(--dsw-alias-label-tertiary, #8a8f98); }
 
-/* ===== 计费表单（白色纸面质感：白底 + 浅灰输入框 + 品牌蓝焦点 + 峰谷配色） ===== */
-#dsh-settings-dialog .dsh-set-subsection-inner .dsh-tb-panel-muted { color: #5b6478; font-size: 11px; }
+/* ===== 计费表单（主题自适应：CSS 变量底 + 品牌蓝焦点 + 峰谷配色） ===== */
+#dsh-settings-dialog .dsh-set-subsection-inner .dsh-tb-panel-muted {
+  color: var(--dsw-alias-label-secondary, #aeb3bd);
+  font-size: 11px;
+}
 #dsh-settings-dialog .dsh-tb-price-head {
   display: flex; align-items: center; justify-content: space-between; gap: 8px;
 }
-#dsh-settings-dialog .dsh-tb-price-select {
-  appearance: none; -webkit-appearance: none;
-  min-width: 128px; height: 26px; padding: 0 24px 0 8px;
-  border: 1px solid #d9dfeb;
-  border-radius: 8px;
-  background-color: #f7f9fc;
-  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 10 10'%3E%3Cpath d='M2 3.5 L5 6.5 L8 3.5' fill='none' stroke='%234d6bfe' stroke-width='1.3' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
-  background-repeat: no-repeat;
-  background-position: right 8px center;
-  color: #1f2430;
-  font: inherit; font-size: 11.5px;
-  font-variant-numeric: tabular-nums;
-  cursor: pointer;
-  transition: border-color .14s ease, box-shadow .14s ease;
+#dsh-settings-dialog .dsh-tb-price-model-select {
+  width: min(220px, 58%);
+  flex: none;
 }
-#dsh-settings-dialog .dsh-tb-price-select:hover { border-color: color-mix(in srgb, #4d6bfe 55%, #d9dfeb); }
-#dsh-settings-dialog .dsh-tb-price-select:focus {
-  outline: none; border-color: #4d6bfe;
-  box-shadow: 0 0 0 3px rgba(77,107,254,.18);
+#dsh-settings-dialog .dsh-tb-price-model-trigger {
+  height: 28px;
+  border: 1px solid var(--dsw-alias-border-l2, rgba(128,128,128,.28));
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--dsw-alias-label-primary, #e8eaf0) 6%, var(--dsw-alias-bg-base, #171b24));
+  color: var(--dsw-alias-label-primary, #e8eaf0);
+  font-size: 11.5px;
+  padding: 0 30px 0 10px;
+}
+#dsh-settings-dialog .dsh-tb-price-model-trigger:hover,
+#dsh-settings-dialog .dsh-tb-price-model-trigger[aria-expanded="true"] {
+  border-color: color-mix(in srgb, #4d6bfe 55%, var(--dsw-alias-border-l2, rgba(128,128,128,.28)));
+  background: color-mix(in srgb, var(--dsw-alias-label-primary, #e8eaf0) 6%, var(--dsw-alias-bg-base, #171b24));
+  color: var(--dsw-alias-label-primary, #e8eaf0);
+}
+#dsh-settings-dialog .dsh-tb-price-model-menu {
+  background: var(--dsw-alias-bg-module-platform, #171b24);
+  border: 1px solid var(--dsw-alias-border-l2, rgba(128,128,128,.28));
+  border-radius: 10px;
+  box-shadow: 0 12px 34px rgba(0, 0, 0, .28);
+}
+#dsh-settings-dialog .dsh-tb-price-model-menu .dsh-llama-preset-option {
+  color: var(--dsw-alias-label-secondary, #aeb3bd);
+  border-radius: 0;
+}
+#dsh-settings-dialog .dsh-tb-price-model-menu .dsh-llama-preset-option:hover,
+#dsh-settings-dialog .dsh-tb-price-model-menu .dsh-llama-preset-option.dsh-llama-preset-option-on {
+  background: color-mix(in srgb, #4d6bfe 12%, transparent);
+  color: var(--dsw-alias-label-primary, #e8eaf0);
 }
 #dsh-settings-dialog .dsh-tb-price-grid {
   margin-top: 10px;
@@ -1400,32 +1513,37 @@ const SETTINGS_DIALOG_CSS = `
   align-items: center;
 }
 #dsh-settings-dialog .dsh-tb-price-grid > span {
-  font-size: 11px; letter-spacing: .03em; color: #5b6478;
+  font-size: 11px; letter-spacing: .03em;
+  color: var(--dsw-alias-label-secondary, #aeb3bd);
 }
 #dsh-settings-dialog .dsh-tb-price-grid > span:nth-child(2) { color: #16a34a; font-weight: 400; }
 #dsh-settings-dialog .dsh-tb-price-grid > span:nth-child(3) { color: #d97706; font-weight: 400; }
 #dsh-settings-dialog .dsh-tb-price-input {
   box-sizing: border-box; width: 100%; height: 26px; padding: 0 8px;
-  border: 1px solid #d9dfeb;
+  border: 1px solid var(--dsw-alias-border-l2, rgba(128,128,128,.28));
   border-radius: 8px;
-  background: #f7f9fc;
-  color: #1f2430;
+  background: color-mix(in srgb, var(--dsw-alias-label-primary, #e8eaf0) 6%, var(--dsw-alias-bg-base, #171b24));
+  color: var(--dsw-alias-label-primary, #e8eaf0);
   font: inherit; font-size: 11.5px;
   font-variant-numeric: tabular-nums;
   outline: none;
   transition: border-color .14s ease, box-shadow .14s ease, background .14s ease;
 }
-#dsh-settings-dialog .dsh-tb-price-input:hover { border-color: color-mix(in srgb, #4d6bfe 45%, #d9dfeb); }
+#dsh-settings-dialog .dsh-tb-price-input:hover {
+  border-color: color-mix(in srgb, #4d6bfe 45%, var(--dsw-alias-border-l2, rgba(128,128,128,.28)));
+}
 #dsh-settings-dialog .dsh-tb-price-input:focus {
   border-color: #4d6bfe;
   box-shadow: 0 0 0 3px rgba(77,107,254,.18);
-  background: #ffffff;
+  background: color-mix(in srgb, var(--dsw-alias-label-primary, #e8eaf0) 8%, var(--dsw-alias-bg-base, #171b24));
 }
-#dsh-settings-dialog .dsh-tb-price-input::placeholder { color: #9aa3b5; }
+#dsh-settings-dialog .dsh-tb-price-input::placeholder {
+  color: var(--dsw-alias-label-tertiary, #8a8f98);
+}
 #dsh-settings-dialog .dsh-tb-price-peak-title {
   margin-top: 12px;
   font-size: 11px; letter-spacing: .03em;
-  color: #5b6478;
+  color: var(--dsw-alias-label-secondary, #aeb3bd);
 }
 /* 峰谷日期：圆形切换按钮（一 ～ 日，蓝色=激活） */
 #dsh-settings-dialog .dsh-tb-price-weekdays {
@@ -1436,12 +1554,17 @@ const SETTINGS_DIALOG_CSS = `
   -webkit-app-region: no-drag;
   appearance: none; cursor: pointer;
   width: 30px; height: 30px; border-radius: 50%;
-  border: 1px solid #d9dfeb; background: #f7f9fc; color: #5b6478;
+  border: 1px solid var(--dsw-alias-border-l2, rgba(128,128,128,.28));
+  background: color-mix(in srgb, var(--dsw-alias-label-primary, #e8eaf0) 6%, var(--dsw-alias-bg-base, #171b24));
+  color: var(--dsw-alias-label-secondary, #aeb3bd);
   font: inherit; font-size: 12px; letter-spacing: .02em;
   display: inline-flex; align-items: center; justify-content: center;
   transition: background .15s ease, border-color .15s ease, color .15s ease, box-shadow .15s ease, transform .06s ease;
 }
-#dsh-settings-dialog .dsh-tb-price-day:hover { border-color: color-mix(in srgb, #4d6bfe 55%, #d9dfeb); color: #4d6bfe; }
+#dsh-settings-dialog .dsh-tb-price-day:hover {
+  border-color: color-mix(in srgb, #4d6bfe 55%, var(--dsw-alias-border-l2, rgba(128,128,128,.28)));
+  color: #4d6bfe;
+}
 #dsh-settings-dialog .dsh-tb-price-day:active { transform: scale(.94); }
 #dsh-settings-dialog .dsh-tb-price-day.dsh-tb-price-day-on {
   background: linear-gradient(135deg, #4d6bfe, #6f8bff);
@@ -1458,35 +1581,50 @@ const SETTINGS_DIALOG_CSS = `
 }
 #dsh-settings-dialog .dsh-tb-time-input {
   flex: 1; min-width: 0; height: 28px; padding: 0 8px;
-  border: 1px solid #d9dfeb; border-radius: 8px;
-  background: #f7f9fc; color: #1f2430;
+  border: 1px solid var(--dsw-alias-border-l2, rgba(128,128,128,.28));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--dsw-alias-label-primary, #e8eaf0) 6%, var(--dsw-alias-bg-base, #171b24));
+  color: var(--dsw-alias-label-primary, #e8eaf0);
   font: inherit; font-size: 12px;
   font-variant-numeric: tabular-nums;
-  outline: none; color-scheme: light;
+  outline: none;
   transition: border-color .14s ease, box-shadow .14s ease, background .14s ease;
 }
-#dsh-settings-dialog .dsh-tb-time-input:hover { border-color: color-mix(in srgb, #4d6bfe 45%, #d9dfeb); }
+#dsh-settings-dialog .dsh-tb-time-input:hover {
+  border-color: color-mix(in srgb, #4d6bfe 45%, var(--dsw-alias-border-l2, rgba(128,128,128,.28)));
+}
 #dsh-settings-dialog .dsh-tb-time-input:focus {
   border-color: #4d6bfe;
   box-shadow: 0 0 0 3px rgba(77, 107, 254, .18);
-  background: #ffffff;
+  background: color-mix(in srgb, var(--dsw-alias-label-primary, #e8eaf0) 8%, var(--dsw-alias-bg-base, #171b24));
 }
-#dsh-settings-dialog .dsh-tb-time-dash { color: #9aa3b5; flex: none; }
+#dsh-settings-dialog .dsh-tb-time-dash {
+  color: var(--dsw-alias-label-tertiary, #8a8f98);
+  flex: none;
+}
 #dsh-settings-dialog .dsh-tb-price-seg-del {
   -webkit-app-region: no-drag;
   appearance: none; cursor: pointer; flex: none;
   width: 26px; height: 26px; border-radius: 7px;
-  border: 1px solid #d9dfeb; background: transparent; color: #9aa3b5;
+  border: 1px solid var(--dsw-alias-border-l2, rgba(128,128,128,.28));
+  background: transparent;
+  color: var(--dsw-alias-label-tertiary, #8a8f98);
   font: inherit; font-size: 14px; line-height: 1;
   display: inline-flex; align-items: center; justify-content: center;
   transition: border-color .14s ease, color .14s ease, background .14s ease;
 }
-#dsh-settings-dialog .dsh-tb-price-seg-del:hover { border-color: #dc2626; color: #dc2626; background: rgba(220, 38, 38, .06); }
+#dsh-settings-dialog .dsh-tb-price-seg-del:hover {
+  border-color: #dc2626;
+  color: #dc2626;
+  background: rgba(220, 38, 38, .08);
+}
 #dsh-settings-dialog .dsh-tb-price-add {
   -webkit-app-region: no-drag;
   appearance: none; cursor: pointer;
   margin-top: 8px; height: 27px; padding: 0 12px; border-radius: 8px;
-  border: 1px dashed #c6cede; background: transparent; color: #5b6478;
+  border: 1px dashed var(--dsw-alias-border-l2, rgba(128,128,128,.34));
+  background: transparent;
+  color: var(--dsw-alias-label-secondary, #aeb3bd);
   font: inherit; font-size: 11.5px; letter-spacing: .02em;
   transition: border-color .14s ease, color .14s ease;
 }
@@ -1497,7 +1635,8 @@ const SETTINGS_DIALOG_CSS = `
 }
 #dsh-settings-dialog .dsh-tb-price-status {
   min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  font-size: 11px; color: #5b6478;
+  font-size: 11px;
+  color: var(--dsw-alias-label-secondary, #aeb3bd);
 }
 #dsh-settings-dialog .dsh-tb-price-status.dsh-tb-price-status-ok { color: #16a34a; font-weight: 400; }
 #dsh-settings-dialog .dsh-tb-price-status.dsh-tb-price-status-err { color: #dc2626; font-weight: 400; }
@@ -1506,12 +1645,16 @@ const SETTINGS_DIALOG_CSS = `
   -webkit-app-region: no-drag;
   appearance: none; cursor: pointer;
   height: 26px; padding: 0 12px; border-radius: 8px;
-  border: 1px solid #d9dfeb;
-  background: transparent; color: #334155;
+  border: 1px solid var(--dsw-alias-border-l2, rgba(128,128,128,.28));
+  background: transparent;
+  color: var(--dsw-alias-label-secondary, #aeb3bd);
   font: inherit; font-size: 11.5px; font-weight: 400;
   transition: background .14s ease, color .14s ease, transform .06s ease;
 }
-#dsh-settings-dialog .dsh-tb-price-btn:hover { background: #f1f5f9; color: #1f2430; }
+#dsh-settings-dialog .dsh-tb-price-btn:hover {
+  background: var(--dsw-alias-interactive-bg-hover, rgba(255,255,255,.08));
+  color: var(--dsw-alias-label-primary, #e8eaf0);
+}
 #dsh-settings-dialog .dsh-tb-price-btn:active { transform: scale(.97); }
 #dsh-settings-dialog .dsh-tb-price-btn.dsh-tb-price-btn-primary {
   border: none;
@@ -1532,6 +1675,136 @@ const SETTINGS_DIALOG_CSS = `
 .dsh-llama-badge-starting::before { animation: dsh-llama-pulse 1s ease-in-out infinite; }
 .dsh-llama-badge-running { background: color-mix(in srgb, #2ea043 18%, transparent); color: #34c56b; }
 .dsh-llama-badge-error { background: color-mix(in srgb, #e45555 18%, transparent); color: #e45555; }
+.dsh-set-row-meta { flex: none; font-size: 12px; color: var(--dsw-alias-label-secondary, #aeb3bd); white-space: nowrap; }
+.dsh-mobile-port-input {
+  flex: none; width: 96px; height: 30px; padding: 0 8px;
+  border: 1px solid var(--dsw-alias-border-l2, rgba(128,128,128,.28));
+  border-radius: 8px; background: transparent; color: inherit; font: inherit; font-size: 12px;
+}
+.dsh-mobile-port-input:focus { outline: none; border-color: color-mix(in srgb, #4d6bfe 55%, transparent); }
+.dsh-mobile-device-list { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+.dsh-mobile-device-item {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 8px 10px; border-radius: 10px;
+  border: 1px solid var(--dsw-alias-border-l2, rgba(128,128,128,.22));
+  background: color-mix(in srgb, var(--dsw-alias-bg-module-platform, #171b24) 70%, transparent);
+  font-size: 12px;
+}
+.dsh-mobile-device-name { color: var(--dsw-alias-label-primary, #e8eaf0); font-weight: 500; }
+.dsh-mobile-device-meta { color: var(--dsw-alias-label-tertiary, #8a8f98); margin-top: 2px; }
+.dsh-mobile-qr-head {
+  display: flex; align-items: center; gap: 8px;
+  margin-bottom: 2px;
+}
+.dsh-mobile-qr-status {
+  flex: 1; min-width: 0;
+  font-size: 11.5px; line-height: 1.35;
+  color: var(--dsw-alias-label-tertiary, #8a8f98);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.dsh-mobile-qr-status.dsh-mobile-qr-status-ready { color: #34c56b; }
+.dsh-mobile-qr-wrap {
+  display: flex; align-items: center; gap: 16px; margin-top: 12px;
+}
+.dsh-mobile-qr {
+  flex: none;
+  width: 168px; height: 168px;
+  border-radius: 10px;
+  background: #ffffff;
+  border: 1px solid rgba(255,255,255,.12);
+  box-shadow: 0 4px 16px rgba(0,0,0,.18);
+  display: grid; place-items: center;
+  overflow: hidden;
+}
+.dsh-mobile-qr svg { width: 100%; height: 100%; display: block; }
+.dsh-mobile-qr-empty {
+  width: 100%; height: 100%;
+  display: grid; place-items: center;
+  background-color: #f3f4f6;
+  background-image:
+    linear-gradient(45deg, rgba(0,0,0,.045) 25%, transparent 25%),
+    linear-gradient(-45deg, rgba(0,0,0,.045) 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, rgba(0,0,0,.045) 75%),
+    linear-gradient(-45deg, transparent 75%, rgba(0,0,0,.045) 75%);
+  background-size: 12px 12px;
+  background-position: 0 0, 0 6px, 6px -6px, -6px 0;
+}
+.dsh-mobile-qr-empty-label {
+  color: #9aa0a8; font-size: 11px; text-align: center;
+  padding: 0 10px; line-height: 1.45;
+}
+.dsh-mobile-qr-side {
+  min-width: 0; flex: 1; align-self: stretch;
+  display: flex; flex-direction: column; justify-content: center; gap: 6px;
+}
+.dsh-mobile-qr-tip {
+  color: var(--dsw-alias-label-primary, #e8eaf0);
+  font-size: 13px; font-weight: 500; line-height: 1.4;
+}
+.dsh-mobile-qr-hint {
+  color: var(--dsw-alias-label-tertiary, #8a8f98);
+  font-size: 12px; line-height: 1.5;
+}
+.dsh-set-btn-ghost:disabled {
+  opacity: .45; cursor: default; pointer-events: none;
+}
+.dsh-mobile-plugin-overlay {
+  position: absolute; inset: 0; z-index: 8; display: none;
+  align-items: center; justify-content: center; padding: 32px;
+  background: color-mix(in srgb, var(--dsw-alias-bg-base, #171b24) 36%, transparent);
+  -webkit-backdrop-filter: blur(14px); backdrop-filter: blur(14px);
+}
+.dsh-set-content.dsh-mobile-plugin-missing .dsh-mobile-plugin-overlay { display: flex; }
+.dsh-mobile-plugin-overlay-inner {
+  width: min(330px, 100%); text-align: center;
+  color: var(--dsw-alias-label-primary, #e8eaf0);
+}
+.dsh-mobile-plugin-overlay-title { font-size: 16px; font-weight: 500; }
+.dsh-mobile-plugin-overlay-sub {
+  margin-top: 8px; color: var(--dsw-alias-label-secondary, #aeb3bd);
+  font-size: 12px; line-height: 1.65;
+}
+.dsh-mobile-plugin-install {
+  -webkit-app-region: no-drag;
+  appearance: none; cursor: pointer; margin-top: 18px;
+  min-width: 112px; height: 32px; padding: 0 16px; border: 0; border-radius: 7px;
+  background: var(--dsh-set-accent, #4d6bfe); color: #fff;
+  font: inherit; font-size: 12px; font-weight: 500;
+  transition: filter .14s ease, transform .06s ease;
+}
+.dsh-mobile-plugin-install:hover { filter: brightness(1.08); }
+.dsh-mobile-plugin-install:active { transform: scale(.98); }
+.dsh-mobile-plugin-install:disabled { cursor: wait; opacity: .72; }
+.dsh-mobile-plugin-progress { margin: 14px auto 0; width: min(248px, 100%); }
+.dsh-mobile-plugin-progress[hidden] { display: none; }
+.dsh-mobile-plugin-progress-stage {
+  min-height: 18px; color: var(--dsw-alias-label-secondary, #aeb3bd);
+  font-size: 11px; line-height: 18px;
+}
+.dsh-mobile-plugin-progress-track {
+  height: 4px; margin-top: 6px; overflow: hidden; border-radius: 999px;
+  background: color-mix(in srgb, var(--dsw-alias-label-tertiary, #8a8f98) 24%, transparent);
+}
+.dsh-mobile-plugin-progress-bar {
+  width: 0; height: 100%; border-radius: inherit;
+  background: var(--dsh-set-accent, #4d6bfe); transition: width .28s ease;
+}
+.dsh-mobile-plugin-credit {
+  margin-top: 11px; color: var(--dsw-alias-label-tertiary, #8a8f98);
+  font-size: 11px; line-height: 1.5;
+}
+.dsh-mobile-plugin-credit a { color: #4d6bfe; text-decoration: underline; text-underline-offset: 2px; }
+.dsh-mobile-credit {
+  margin-top: 14px; padding: 0 4px;
+  text-align: center;
+  color: var(--dsw-alias-label-tertiary, #8a8f98);
+  font-size: 11px; line-height: 1.5;
+}
+.dsh-mobile-credit a {
+  color: #4d6bfe; text-decoration: underline; text-underline-offset: 2px;
+  cursor: pointer;
+}
 @keyframes dsh-llama-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
 .dsh-llama-actions { display: inline-flex; align-items: center; gap: 8px; flex: none; }
 .dsh-llama-title-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
@@ -1629,7 +1902,10 @@ const SETTINGS_DIALOG_CSS = `
   display: grid; grid-template-columns: 1fr 1fr; gap: 9px 10px; margin-top: 10px;
 }
 #dsh-settings-dialog .dsh-llama-field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
-#dsh-settings-dialog .dsh-llama-field > span { font-size: 11px; letter-spacing: .03em; color: #5b6478; }
+#dsh-settings-dialog .dsh-llama-field > span {
+  font-size: 11px; letter-spacing: .03em;
+  color: var(--dsw-alias-label-secondary, #aeb3bd);
+}
 #dsh-settings-dialog .dsh-llama-field-wide { grid-column: 1 / -1; }
 #dsh-settings-dialog .dsh-llama-field input { width: 100%; }
 `;
@@ -1637,10 +1913,12 @@ const SETTINGS_DIALOG_CSS = `
 const PRICING_FORM_HTML = `
   <div class="dsh-tb-price-head">
     <span class="dsh-tb-panel-muted">模型</span>
-    <select class="dsh-tb-price-select" id="dsh-tb-price-model">
-      <option value="deepseek-v4-flash">deepseek-v4-flash</option>
-      <option value="deepseek-v4-pro">deepseek-v4-pro</option>
-    </select>
+    <div class="dsh-llama-preset-select dsh-tb-price-model-select" id="dsh-tb-price-model-select">
+      <button class="dsh-llama-preset-trigger dsh-tb-price-model-trigger" id="dsh-tb-price-model-trigger" type="button" aria-haspopup="listbox" aria-expanded="false">
+        <span class="dsh-llama-preset-text"><span class="dsh-llama-preset-text-inner" id="dsh-tb-price-model-trigger-text">DeepSeek-V4-Flash</span></span>
+      </button>
+      <div class="dsh-llama-preset-menu dsh-tb-price-model-menu" id="dsh-tb-price-model-menu" role="listbox"></div>
+    </div>
   </div>
   <div class="dsh-tb-price-grid">
     <span></span><span>谷</span><span>峰</span>
@@ -1750,6 +2028,7 @@ function ensureSettingsDialog() {
           <button class="dsh-set-nav dsh-set-nav-on" data-panel="versions" type="button">Harness 版本</button>
           <button class="dsh-set-nav" data-panel="general" type="button">通用</button>
           <button class="dsh-set-nav" data-panel="llama" type="button">llama 启动器</button>
+          <button class="dsh-set-nav" data-panel="mobile" type="button">移动设备</button>
         </div>
         <div class="dsh-set-content">
           <section class="dsh-set-panel dsh-set-panel-on" data-panel="versions">
@@ -1871,6 +2150,108 @@ function ensureSettingsDialog() {
               </div>
             </div>
           </section>
+          <section class="dsh-set-panel" data-panel="mobile">
+            <div class="dsh-set-panel-head">
+              <div class="dsh-set-panel-title">移动设备</div>
+              <div class="dsh-set-panel-sub" id="dsh-mobile-head-sub">通过设备鉴权安全连接</div>
+            </div>
+            <div class="dsh-set-section">
+              <div class="dsh-set-row">
+                <div class="dsh-set-row-text">
+                  <div class="dsh-set-row-title">允许移动设备连接</div>
+                  <div class="dsh-set-row-sub">开启后 Android 与 iPhone 可安全同步会话与实时 Agent 状态</div>
+                </div>
+                <span class="dsh-mobile-switch-control">
+                  <span class="dsh-mobile-switch-feedback" id="dsh-mobile-switch-feedback">已关闭</span>
+                  <label class="dsh-set-switch" id="dsh-mobile-switch"><input type="checkbox" id="dsh-mobile-enabled"><span class="dsh-set-switch-track"></span></label>
+                </span>
+              </div>
+            </div>
+            <div class="dsh-set-section">
+              <div class="dsh-set-row">
+                <div class="dsh-set-row-text">
+                  <div class="dsh-set-row-title">连接模式</div>
+                  <div class="dsh-set-row-sub" id="dsh-mobile-mode-sub">局域网优先，公网备用</div>
+                </div>
+                <span class="dsh-set-row-meta" id="dsh-mobile-mode-label">自动</span>
+              </div>
+              <div class="dsh-set-row">
+                <div class="dsh-set-row-text">
+                  <div class="dsh-set-row-title">公网接入</div>
+                  <div class="dsh-set-row-sub">使用固定域名 Cloudflare Tunnel 提供 WSS 安全连接</div>
+                </div>
+                <span class="dsh-llama-actions"><span class="dsh-set-row-meta" id="dsh-mobile-relay-label">未配置</span><button class="dsh-set-btn dsh-set-btn-ghost dsh-set-btn-sm" id="dsh-mobile-tunnel-config" type="button">配置</button></span>
+              </div>
+            </div>
+            <div class="dsh-set-section">
+              <div class="dsh-set-row" style="align-items:flex-start;">
+                <div class="dsh-set-row-text" style="flex:1;">
+                  <div class="dsh-mobile-qr-head">
+                    <div class="dsh-set-row-title">扫码连接</div>
+                    <span class="dsh-mobile-qr-status" id="dsh-mobile-qr-status">已关闭</span>
+                    <button class="dsh-set-btn dsh-set-btn-ghost dsh-set-btn-sm" id="dsh-mobile-refresh-pair" type="button">刷新</button>
+                  </div>
+                  <div class="dsh-set-row-sub">使用 DeepSeekHarness 完成一次性设备配对</div>
+                  <div class="dsh-mobile-qr-wrap">
+                    <div class="dsh-mobile-qr" id="dsh-mobile-qr" aria-label="扫码配对二维码"></div>
+                    <div class="dsh-mobile-qr-side">
+                      <div class="dsh-mobile-qr-tip" id="dsh-mobile-qr-tip">先开启移动设备连接</div>
+                      <div class="dsh-mobile-qr-hint" id="dsh-mobile-qr-hint">开启后可生成一次性配对二维码</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div class="dsh-set-section">
+              <div class="dsh-set-row">
+                <div class="dsh-set-row-text">
+                  <div class="dsh-set-row-title">连接地址</div>
+                  <div class="dsh-set-row-sub dsh-llama-mono" id="dsh-mobile-url">—</div>
+                </div>
+                <span class="dsh-llama-actions">
+                  <button class="dsh-set-btn dsh-set-btn-ghost dsh-set-btn-sm" id="dsh-mobile-copy-url" type="button">复制</button>
+                </span>
+              </div>
+              <div class="dsh-set-row">
+                <div class="dsh-set-row-text">
+                  <div class="dsh-set-row-title">监听端口</div>
+                  <div class="dsh-set-row-sub">Gateway 独立局域网 WebSocket 端口（默认 3081）</div>
+                </div>
+                <input class="dsh-mobile-port-input" id="dsh-mobile-port" type="number" disabled aria-label="Gateway 局域网监听端口" />
+              </div>
+            </div>
+            <div class="dsh-set-section">
+              <div class="dsh-set-row" style="align-items:flex-start;">
+                <div class="dsh-set-row-text">
+                  <div class="dsh-set-row-title">已连接设备</div>
+                  <div class="dsh-set-row-sub" id="dsh-mobile-devices-empty">暂无设备</div>
+                  <div class="dsh-mobile-device-list" id="dsh-mobile-device-list"></div>
+                </div>
+              </div>
+            </div>
+            <div class="dsh-set-section">
+              <div class="dsh-set-row">
+                <div class="dsh-set-row-text">
+                  <div class="dsh-set-row-title">服务状态</div>
+                  <div class="dsh-set-row-sub" id="dsh-mobile-status-detail">未启动</div>
+                </div>
+                <span class="dsh-llama-badge dsh-llama-badge-stopped" id="dsh-mobile-badge">已停止</span>
+              </div>
+            </div>
+            <div class="dsh-mobile-credit">该插件来自 GitHub 作者 <a href="https://github.com/Clarklevis1995" target="_blank" rel="noopener noreferrer">Chaofan Li</a></div>
+          </section>
+          <div class="dsh-mobile-plugin-overlay" id="dsh-mobile-plugin-overlay" aria-live="polite">
+            <div class="dsh-mobile-plugin-overlay-inner">
+              <div class="dsh-mobile-plugin-overlay-title">当前未安装移动网关插件</div>
+              <div class="dsh-mobile-plugin-overlay-sub">安装后即可使用扫码连接、局域网和公网接入。</div>
+              <button class="dsh-mobile-plugin-install" id="dsh-mobile-install-latest" type="button">立即安装</button>
+              <div class="dsh-mobile-plugin-progress" id="dsh-mobile-plugin-progress" hidden>
+                <div class="dsh-mobile-plugin-progress-stage" id="dsh-mobile-plugin-progress-stage"></div>
+                <div class="dsh-mobile-plugin-progress-track"><div class="dsh-mobile-plugin-progress-bar" id="dsh-mobile-plugin-progress-bar"></div></div>
+              </div>
+              <div class="dsh-mobile-plugin-credit">该插件来自 GitHub 作者 <a href="https://github.com/Clarklevis1995" target="_blank" rel="noopener noreferrer">Chaofan Li</a></div>
+            </div>
+          </div>
         </div>
       </div>
       <div class="dsh-confirm-backdrop" id="dsh-llama-delete-confirm" role="dialog" aria-modal="true" aria-labelledby="dsh-llama-delete-confirm-title">
@@ -1907,7 +2288,7 @@ function ensureSettingsDialog() {
   balancePluginInput.addEventListener("change", () => api.saveSettings({ balancePlugin: balancePluginInput.checked }));
   const receiptInput = settingsDialogEl.querySelector("#dsh-set-receipt");
   receiptInput.addEventListener("change", () => api.saveSettings({ receiptEnabled: receiptInput.checked }));
-  // 余额插件设置：白色可折叠表单（收起时保留填写项预览）；首次创建即绑定一次
+  // 余额插件设置：主题自适应可折叠表单；首次创建即绑定一次
   const pricingToggle = settingsDialogEl.querySelector("#dsh-set-pricing-toggle");
   const pricingBody = settingsDialogEl.querySelector("#dsh-set-pricing-body");
   pricingToggle.addEventListener("click", () => {
@@ -1926,6 +2307,62 @@ function ensureSettingsDialog() {
   llamaAutoInput.addEventListener("change", () => api.llamaSave({ autoStart: llamaAutoInput.checked }));
   settingsDialogEl.querySelector("#dsh-llama-start").addEventListener("click", () => api.llamaStart());
   settingsDialogEl.querySelector("#dsh-llama-stop").addEventListener("click", () => api.llamaStop());
+  // 手机连接面板
+  const mobileEnabledInput = settingsDialogEl.querySelector("#dsh-mobile-enabled");
+  mobileEnabledInput.addEventListener("change", async () => {
+    if (mobileTogglePending) return;
+    const requested = mobileEnabledInput.checked;
+    const previous = mobileGatewayStatus?.gatewayEnabled === true;
+    mobileTogglePending = true;
+    setMobileToggleFeedback("loading", requested ? "正在开启…" : "正在关闭…");
+    mobileEnabledInput.disabled = true;
+    try {
+      await api.mobileSave({ enabled: requested });
+      await mobileGatewayRequest("/mgw/gateway", {
+        method: "POST",
+        body: { mode: requested ? "persistent" : "disabled" },
+      });
+      await refreshMobilePanel();
+      if (mobileGatewayStatus?.gatewayEnabled !== requested) {
+        throw new Error("Gateway 未确认开关状态");
+      }
+      setMobileToggleFeedback("success", requested ? "已开启" : "已关闭");
+    } catch (error) {
+      mobileEnabledInput.checked = previous;
+      setMobileToggleFeedback("error", "切换失败");
+      const detail = settingsDialogEl.querySelector("#dsh-mobile-status-detail");
+      if (detail) detail.textContent = `切换失败：${error?.message || "请重试"}`;
+    } finally {
+      mobileTogglePending = false;
+      mobileEnabledInput.disabled = false;
+      await refreshMobilePanel();
+    }
+  });
+  settingsDialogEl.querySelector("#dsh-mobile-refresh-pair").addEventListener("click", async () => {
+    try {
+      await createMobileGatewayPairing();
+      await refreshMobilePanel();
+    } catch (error) { alertMobileGatewayError(error); }
+  });
+  settingsDialogEl.querySelector("#dsh-mobile-tunnel-config").addEventListener("click", () => configureMobileTunnel());
+  settingsDialogEl.querySelector("#dsh-mobile-install-latest").addEventListener("click", async () => {
+    try {
+      await api.mobileInstallLatest();
+      await refreshMobilePanel();
+    } catch (error) { alertMobileGatewayError(error); }
+  });
+  settingsDialogEl.querySelector("#dsh-mobile-copy-url").addEventListener("click", async () => {
+    const urlEl = settingsDialogEl.querySelector("#dsh-mobile-url");
+    const text = urlEl ? urlEl.textContent : "";
+    if (!text || text === "—") return;
+    try {
+      await navigator.clipboard.writeText(text);
+      const btn = settingsDialogEl.querySelector("#dsh-mobile-copy-url");
+      const prev = btn.textContent;
+      btn.textContent = "已复制";
+      setTimeout(() => { btn.textContent = prev; }, 1200);
+    } catch { /* ignore */ }
+  });
   const llamaPresetToggle = settingsDialogEl.querySelector("#dsh-llama-preset-toggle");
   const llamaPresetBody = settingsDialogEl.querySelector("#dsh-llama-preset-body");
   llamaPresetToggle.addEventListener("click", () => {
@@ -2112,7 +2549,10 @@ function ensureSettingsDialog() {
 }
 
 function selectSettingsPanel(panel) {
-  settingsPanelName = panel === "general" ? "general" : panel === "llama" ? "llama" : "versions";
+  const allowed = ["versions", "general", "llama", "mobile"];
+  settingsPanelName = allowed.includes(panel) ? panel : "versions";
+  const content = settingsDialogEl.querySelector(".dsh-set-content");
+  if (content && settingsPanelName !== "mobile") content.classList.remove("dsh-mobile-plugin-missing");
   settingsDialogEl.querySelectorAll(".dsh-set-nav").forEach((btn) => {
     btn.classList.toggle("dsh-set-nav-on", btn.dataset.panel === settingsPanelName);
   });
@@ -2121,6 +2561,12 @@ function selectSettingsPanel(panel) {
   });
   if (settingsPanelName === "versions") refreshVersionList();
   if (settingsPanelName === "llama") refreshLlamaPanel();
+  if (settingsPanelName === "mobile") {
+    refreshMobilePanel({ refreshPairing: true });
+    startMobilePanelRefresh();
+  } else {
+    stopMobilePanelRefresh();
+  }
   syncSettingsSwitches();
 }
 
@@ -2149,6 +2595,7 @@ function openSettingsDialog() {
 
 function closeSettingsDialog() {
   if (settingsDialogEl) settingsDialogEl.classList.remove("dsh-set-open");
+  stopMobilePanelRefresh();
 }
 
 function syncSettingsSwitches() {
@@ -2314,6 +2761,332 @@ function updateLlamaStatusView(status) {
   if (stopBtn) stopBtn.disabled = state === "stopped";
   const head = settingsDialogEl.querySelector("#dsh-llama-head-sub");
   if (head) head.textContent = state === "running" ? `运行中 · ${st.endpoint}` : "本地模型服务 llama-server";
+}
+
+// ---------- 移动设备（dsh-plugin-mobile-gateway） ----------
+let mobileStatusLocal = null;
+let mobileGatewayStatus = null;
+let mobileGatewayDevices = [];
+let mobilePairing = null;
+let mobileTogglePending = false;
+let mobileToggleFeedbackTimer = null;
+let mobilePairCountdownTimer = null;
+let mobilePanelRefreshTimer = null;
+let mobilePanelRefreshInFlight = false;
+
+function stopMobilePanelRefresh() {
+  if (mobilePanelRefreshTimer) clearInterval(mobilePanelRefreshTimer);
+  mobilePanelRefreshTimer = null;
+}
+
+function startMobilePanelRefresh() {
+  stopMobilePanelRefresh();
+  mobilePanelRefreshTimer = setInterval(() => {
+    if (!settingsDialogEl?.classList.contains("dsh-set-open") || settingsPanelName !== "mobile") {
+      stopMobilePanelRefresh();
+      return;
+    }
+    if (mobilePanelRefreshInFlight) return;
+    mobilePanelRefreshInFlight = true;
+    refreshMobilePanel().finally(() => { mobilePanelRefreshInFlight = false; });
+  }, 3000);
+}
+
+function renderMobileToggleFeedback(gateway = {}) {
+  if (mobileTogglePending || !settingsDialogEl) return;
+  const feedback = settingsDialogEl.querySelector("#dsh-mobile-switch-feedback");
+  const toggle = settingsDialogEl.querySelector("#dsh-mobile-switch");
+  if (feedback) {
+    feedback.textContent = gateway.gatewayEnabled === true ? "已开启" : "已关闭";
+    feedback.className = "dsh-mobile-switch-feedback";
+  }
+  if (toggle) toggle.classList.remove("dsh-mobile-switch-loading", "dsh-mobile-switch-success");
+}
+
+function setMobileToggleFeedback(state, text) {
+  if (!settingsDialogEl) return;
+  if (mobileToggleFeedbackTimer) {
+    clearTimeout(mobileToggleFeedbackTimer);
+    mobileToggleFeedbackTimer = null;
+  }
+  const feedback = settingsDialogEl.querySelector("#dsh-mobile-switch-feedback");
+  const toggle = settingsDialogEl.querySelector("#dsh-mobile-switch");
+  if (feedback) {
+    feedback.textContent = text;
+    feedback.className = `dsh-mobile-switch-feedback dsh-mobile-switch-feedback-${state === "success" ? "ok" : state}`;
+  }
+  if (toggle) {
+    toggle.classList.toggle("dsh-mobile-switch-loading", state === "loading");
+    toggle.classList.toggle("dsh-mobile-switch-success", state === "success");
+  }
+  if (state === "success" || state === "error") {
+    mobileToggleFeedbackTimer = setTimeout(() => {
+      mobileToggleFeedbackTimer = null;
+      renderMobileToggleFeedback(mobileGatewayStatus || {});
+    }, 1800);
+  }
+}
+
+function ensureMobilePairCountdown() {
+  if (mobilePairCountdownTimer) return;
+  mobilePairCountdownTimer = setInterval(() => {
+    if (!settingsDialogEl || settingsPanelName !== "mobile") return;
+    if (!mobilePairing?.pairing?.expiresAt) return;
+    const remaining = Number(mobilePairing.pairing.expiresAt) - Date.now();
+    if (remaining <= 0) {
+      mobilePairing = null;
+      renderMobilePanel(mobileStatusLocal);
+      return;
+    }
+    const statusEl = settingsDialogEl.querySelector("#dsh-mobile-qr-status");
+    if (!statusEl) return;
+    const secs = Math.ceil(remaining / 1000);
+    const mm = String(Math.floor(secs / 60)).padStart(2, "0");
+    const ss = String(secs % 60).padStart(2, "0");
+    statusEl.textContent = `可扫码 · 剩余 ${mm}:${ss}`;
+    statusEl.className = "dsh-mobile-qr-status dsh-mobile-qr-status-ready";
+  }, 1000);
+}
+
+function formatMobileSeen(ts) {
+  if (!ts) return "—";
+  const diff = Date.now() - Number(ts);
+  if (diff < 60_000) return "刚刚";
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前`;
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)} 小时前`;
+  return new Date(ts).toLocaleString();
+}
+
+function alertMobileGatewayError(error) {
+  const message = error && error.message ? error.message : String(error || "移动网关操作失败");
+  window.alert(message);
+}
+
+async function mobileGatewayRequest(pathname, options = {}) {
+  const response = await fetch(pathname, {
+    method: options.method || "GET",
+    credentials: "same-origin",
+    headers: options.body === undefined ? undefined : { "content-type": "application/json" },
+    body: options.body === undefined ? undefined : JSON.stringify(options.body),
+  });
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) throw new Error(payload?.message || payload?.error || `移动网关请求失败（HTTP ${response.status}）`);
+  return payload;
+}
+
+function currentMobilePairingEndpoint(status, gateway) {
+  const lan = Array.isArray(gateway?.lan?.urls) ? gateway.lan.urls : [];
+  if (status.publicWssUrl) {
+    if (!status.tunnel?.running) throw new Error("Cloudflare Tunnel 未就绪，不能生成包含公网地址的二维码");
+    return { primary: status.publicWssUrl, endpoints: [status.publicWssUrl, ...lan] };
+  }
+  if (!lan.length) throw new Error("Gateway 局域网监听未就绪，请先安装兼容 Gateway 并重启 Harness");
+  return { primary: lan[0], endpoints: lan };
+}
+
+async function createMobileGatewayPairing() {
+  const status = mobileStatusLocal || {};
+  const gateway = mobileGatewayStatus || {};
+  if (!gateway.gatewayEnabled) throw new Error("请先允许移动设备连接");
+  const endpoint = currentMobilePairingEndpoint(status, gateway);
+  const result = await mobileGatewayRequest("/mgw/pair", {
+    method: "POST",
+    body: { name: "DeepSeekHarness", publicUrl: endpoint.primary, endpoints: endpoint.endpoints },
+  });
+  if (!result?.qrPayload || !result?.pairing?.expiresAt) throw new Error("Gateway 返回的二维码数据无效");
+  mobilePairing = result;
+  return result;
+}
+
+async function configureMobileTunnel() {
+  const current = mobileStatusLocal?.publicWssUrl || "wss://mobile.example.com/ws/mobile";
+  const publicWssUrl = window.prompt("固定公网 WSS 地址（必须为 wss://域名/ws/mobile）", current);
+  if (publicWssUrl === null) return;
+  const token = window.prompt("Cloudflare Named Tunnel Token（仅保存于 Windows 加密存储）", "");
+  if (token === null) return;
+  try {
+    await api.mobileTunnelConfigure({ publicWssUrl, token });
+    await refreshMobilePanel();
+  } catch (error) { alertMobileGatewayError(error); }
+}
+
+function renderMobilePanel(status) {
+  if (status && typeof status === "object") mobileStatusLocal = status;
+  if (!settingsDialogEl) return;
+  const st = mobileStatusLocal || {};
+  const gateway = mobileGatewayStatus || {};
+  const plugin = st.plugin || {};
+  const pluginMissing = plugin.installed !== true;
+  const content = settingsDialogEl.querySelector(".dsh-set-content");
+  if (content) content.classList.toggle("dsh-mobile-plugin-missing", settingsPanelName === "mobile" && pluginMissing);
+  const installButton = settingsDialogEl.querySelector("#dsh-mobile-install-latest");
+  if (installButton) {
+    installButton.disabled = plugin.installing === true;
+    installButton.textContent = plugin.installing ? "正在安装…" : "立即安装";
+  }
+  const installProgress = settingsDialogEl.querySelector("#dsh-mobile-plugin-progress");
+  const installStage = settingsDialogEl.querySelector("#dsh-mobile-plugin-progress-stage");
+  const installBar = settingsDialogEl.querySelector("#dsh-mobile-plugin-progress-bar");
+  if (installProgress) installProgress.hidden = plugin.installing !== true && !plugin.error;
+  if (installStage) installStage.textContent = plugin.error ? "安装失败，请检查网络后重试" : (plugin.stage || "");
+  if (installBar) installBar.style.width = `${Math.max(0, Math.min(100, Number(plugin.percent) || 0))}%`;
+  const enabledInput = settingsDialogEl.querySelector("#dsh-mobile-enabled");
+  if (enabledInput && !mobileTogglePending) enabledInput.checked = gateway.gatewayEnabled === true;
+  if (!mobileTogglePending && !mobileToggleFeedbackTimer) renderMobileToggleFeedback(gateway);
+  const portInput = settingsDialogEl.querySelector("#dsh-mobile-port");
+  if (portInput && document.activeElement !== portInput) {
+    portInput.value = String(gateway.lan?.port || st.lanPort || 3081);
+  }
+  const modeLabel = settingsDialogEl.querySelector("#dsh-mobile-mode-label");
+  if (modeLabel) modeLabel.textContent = "自动";
+  const modeSub = settingsDialogEl.querySelector("#dsh-mobile-mode-sub");
+  if (modeSub) modeSub.textContent = "局域网优先，公网 WSS 备用";
+  const relayLabel = settingsDialogEl.querySelector("#dsh-mobile-relay-label");
+  if (relayLabel) relayLabel.textContent = st.tunnel?.running ? "已连接" : st.tunnel?.configured ? "未连接" : "未配置";
+  const urlEl = settingsDialogEl.querySelector("#dsh-mobile-url");
+  const lanUrl = Array.isArray(gateway.lan?.urls) ? gateway.lan.urls[0] : null;
+  if (urlEl) urlEl.textContent = st.publicWssUrl || lanUrl || "—";
+  const expiresAt = Number(mobilePairing?.pairing?.expiresAt || 0);
+  let remainingMs = expiresAt - Date.now();
+  if (remainingMs <= 0) {
+    mobilePairing = null;
+    remainingMs = 0;
+  }
+  const qrEnabled = gateway.gatewayEnabled === true;
+  const hasQr = Boolean(mobilePairing?.svg);
+  const statusEl = settingsDialogEl.querySelector("#dsh-mobile-qr-status");
+  const tipEl = settingsDialogEl.querySelector("#dsh-mobile-qr-tip");
+  const hintEl = settingsDialogEl.querySelector("#dsh-mobile-qr-hint");
+  const refreshBtn = settingsDialogEl.querySelector("#dsh-mobile-refresh-pair");
+  if (statusEl) {
+    if (!qrEnabled) {
+      statusEl.textContent = "已关闭";
+      statusEl.className = "dsh-mobile-qr-status";
+    } else if (hasQr) {
+      const secs = Math.ceil(remainingMs / 1000);
+      const mm = String(Math.floor(secs / 60)).padStart(2, "0");
+      const ss = String(secs % 60).padStart(2, "0");
+      statusEl.textContent = `可扫码 · 剩余 ${mm}:${ss}`;
+      statusEl.className = "dsh-mobile-qr-status dsh-mobile-qr-status-ready";
+    } else {
+      statusEl.textContent = "未生成";
+      statusEl.className = "dsh-mobile-qr-status";
+    }
+  }
+  if (refreshBtn) refreshBtn.disabled = !qrEnabled;
+  if (tipEl) {
+    tipEl.textContent = !qrEnabled
+      ? "先开启移动设备连接"
+      : hasQr
+        ? "使用 DeepSeekHarness 扫码配对"
+        : "生成配对二维码";
+  }
+  if (hintEl) {
+    hintEl.textContent = !qrEnabled
+      ? "开启后可生成一次性配对二维码"
+      : hasQr
+        ? ""
+        : "点击“刷新”生成新的二维码";
+  }
+  const qrEl = settingsDialogEl.querySelector("#dsh-mobile-qr");
+  if (qrEl) {
+    if (hasQr) {
+      qrEl.innerHTML = mobilePairing.svg;
+    } else {
+      const label = qrEnabled ? "暂无二维码<br/>点击刷新生成" : "未启用连接";
+      qrEl.innerHTML = `<div class="dsh-mobile-qr-empty"><div class="dsh-mobile-qr-empty-label">${label}</div></div>`;
+    }
+  }
+  ensureMobilePairCountdown();
+  const devices = mobileGatewayDevices;
+  const emptyEl = settingsDialogEl.querySelector("#dsh-mobile-devices-empty");
+  const listEl = settingsDialogEl.querySelector("#dsh-mobile-device-list");
+  if (emptyEl) emptyEl.hidden = devices.length > 0;
+  if (listEl) {
+    listEl.innerHTML = "";
+    for (const device of devices) {
+      const item = document.createElement("div");
+      item.className = "dsh-mobile-device-item";
+      const info = document.createElement("div");
+      info.innerHTML = `<div class="dsh-mobile-device-name"></div><div class="dsh-mobile-device-meta"></div>`;
+      info.querySelector(".dsh-mobile-device-name").textContent = device.name || "移动设备";
+      info.querySelector(".dsh-mobile-device-meta").textContent = `${device.online ? "在线 · " : ""}最近活跃 ${formatMobileSeen(device.lastSeenAt)}`;
+      const revoke = document.createElement("button");
+      revoke.type = "button";
+      revoke.className = "dsh-set-btn dsh-set-btn-ghost dsh-set-btn-sm";
+      revoke.textContent = "断开";
+      revoke.addEventListener("click", async () => {
+        try {
+          await mobileGatewayRequest(`/mgw/devices/${encodeURIComponent(device.id)}/revoke`, { method: "POST", body: {} });
+          await refreshMobilePanel();
+        } catch (error) { alertMobileGatewayError(error); }
+      });
+      item.appendChild(info);
+      item.appendChild(revoke);
+      listEl.appendChild(item);
+    }
+  }
+  const running = gateway.gatewayEnabled === true;
+  const badge = settingsDialogEl.querySelector("#dsh-mobile-badge");
+  if (badge) {
+    if (running) {
+      badge.textContent = "运行中";
+      badge.className = "dsh-llama-badge dsh-llama-badge-running";
+    } else if (st.enabled) {
+      badge.textContent = "启动中";
+      badge.className = "dsh-llama-badge dsh-llama-badge-starting";
+    } else {
+      badge.textContent = "已停止";
+      badge.className = "dsh-llama-badge dsh-llama-badge-stopped";
+    }
+  }
+  const detail = settingsDialogEl.querySelector("#dsh-mobile-status-detail");
+  if (detail) {
+    if (!pluginMissing && gateway.error) detail.textContent = `Gateway 未就绪：${gateway.error}`;
+    else if (!running) detail.textContent = "未启用。允许移动设备连接后即可扫码配对";
+    else if (running) {
+      detail.textContent = `Gateway 已启用 · LAN ${gateway.lan?.listening ? `0.0.0.0:${gateway.lan.port}` : "未监听"}${st.tunnel?.running ? " · WSS Tunnel 已连接" : ""}`;
+    } else detail.textContent = "服务未运行，请安装移动网关后重试";
+  }
+  const head = settingsDialogEl.querySelector("#dsh-mobile-head-sub");
+  if (head) {
+    head.textContent = running
+      ? `运行中 · ${st.publicWssUrl || lanUrl || "等待局域网地址"}`
+      : "通过设备鉴权安全连接";
+  }
+}
+
+async function refreshMobilePanel({ refreshPairing = false } = {}) {
+  if (!settingsDialogEl) return;
+  try {
+    const data = await api.mobileGet();
+    mobileStatusLocal = data?.status || mobileStatusLocal;
+    if (mobileStatusLocal?.plugin?.installed !== true) {
+      mobileGatewayStatus = {};
+      mobileGatewayDevices = [];
+      renderMobilePanel(mobileStatusLocal);
+      return;
+    }
+    const [gateway, devices] = await Promise.all([
+      mobileGatewayRequest("/mgw/status"),
+      mobileGatewayRequest("/mgw/devices"),
+    ]);
+    mobileGatewayStatus = gateway;
+    mobileGatewayDevices = Array.isArray(devices?.devices) ? devices.devices : [];
+    if (refreshPairing && mobileGatewayStatus.gatewayEnabled === true) {
+      try {
+        await createMobileGatewayPairing();
+      } catch (error) {
+        // Keep an existing QR code usable when automatic renewal is unavailable.
+        console.warn("无法自动刷新移动设备配对二维码", error);
+      }
+    }
+    renderMobilePanel(data?.status || mobileStatusLocal);
+  } catch (error) {
+    mobileGatewayStatus = { error: error?.message || "无法读取移动网关状态" };
+    mobileGatewayDevices = [];
+    renderMobilePanel(mobileStatusLocal);
+  }
 }
 
 /** 底部固定状态栏：状态文字固定不动（无布局跳动）。 */
@@ -3991,6 +4764,8 @@ function boot() {
     ipcRenderer.on("dsh:update-status", (_event, status) => handleUpdateStatus(status));
     // llama-server 状态实时刷新（启动中/运行中/错误徽标与启停按钮）
     ipcRenderer.on("dsh:llama-status-changed", (_event, status) => updateLlamaStatusView(status));
+    // 手机连接状态实时刷新
+    ipcRenderer.on("dsh:mobile-status-changed", (_event, status) => renderMobilePanel(status));
     // 通知主进程：本页面 preload 已就绪（用于更新完成后重载页面的握手）
     ipcRenderer.send("dsh:renderer-ready");
     // 上报应用主题给主进程（持久化，供下次启动画面跟随主题）
@@ -4041,6 +4816,17 @@ const api = {
     const listener = (_event, status) => cb(status);
     ipcRenderer.on("dsh:llama-status-changed", listener);
     return () => ipcRenderer.removeListener("dsh:llama-status-changed", listener);
+  },
+  // 移动设备：Gateway 管理 API 本身必须由同源页面直接请求 /mgw/*。
+  mobileGet: () => ipcRenderer.invoke("dsh:mobile-get"),
+  mobileSave: (patch) => ipcRenderer.invoke("dsh:mobile-save", patch),
+  mobileTunnelConfigure: (value) => ipcRenderer.invoke("dsh:mobile-tunnel-configure", value),
+  mobileTunnelClear: () => ipcRenderer.invoke("dsh:mobile-tunnel-clear"),
+  mobileInstallLatest: () => ipcRenderer.invoke("dsh:mobile-install-latest"),
+  onMobileStatusChanged: (cb) => {
+    const listener = (_event, status) => cb(status);
+    ipcRenderer.on("dsh:mobile-status-changed", listener);
+    return () => ipcRenderer.removeListener("dsh:mobile-status-changed", listener);
   },
   getPendingInstall: () => ipcRenderer.invoke("dsh:get-pending-install"),
   cancelInstall: () => ipcRenderer.send("dsh:cancel-install"),

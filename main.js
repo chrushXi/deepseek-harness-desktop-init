@@ -10,7 +10,7 @@
  *  4. 通过软件托管的 npm 安装槽（npmmirror，可回退 npmjs）安装、启动和更新 dsh。
  */
 
-const { app, BrowserWindow, dialog, ipcMain, shell, nativeTheme } = require("electron");
+const { app, BrowserWindow, dialog, ipcMain, shell, nativeTheme, safeStorage } = require("electron");
 const { spawn, execFile } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -60,6 +60,8 @@ const NODE_MSI_DOWNLOAD_URLS = [
 ].filter(Boolean);
 const DSH_INSTALL_VERSION = "0.1.0-rc.7";
 const DSH_MIN_RUNTIME_NODE_MAJOR = 24;
+const MOBILE_GATEWAY_PACKAGE = "dsh-plugin-mobile-gateway";
+const MOBILE_GATEWAY_LATEST_SPEC = `${MOBILE_GATEWAY_PACKAGE}@latest`;
 
 // ---------- 路径 ----------
 const isDev = !app.isPackaged;
@@ -309,6 +311,8 @@ async function probeNetworkSource() {
 /** Desktop-bundled damage monitor layer; mounted automatically for every web boot. */
 const DAMAGE_PULSE_PATCH = path.join(INTERNAL_DIR, "damage-pulse", "cordis.patch.yml");
 const DAMAGE_PULSE_MODULE = path.join(INTERNAL_DIR, "damage-pulse");
+const REASONING_EFFORT_PATCH = path.join(INTERNAL_DIR, "reasoning-effort", "cordis.patch.yml");
+const REASONING_EFFORT_MODULE = path.join(INTERNAL_DIR, "reasoning-effort");
 
 // ---------- 启动画面主题（跟随应用主题，持久化；首次运行跟随系统深浅色） ----------
 const THEME_FILE = () => path.join(app.getPath("userData"), "theme.json");
@@ -397,13 +401,249 @@ function defaultLlamaPreset() {
   for (const field of LLAMA_PRESET_FIELDS) preset[field] = DEFAULT_LLAMA_SETTINGS[field];
   return preset;
 }
+/**
+ * 移动设备连接只保存非敏感配置。Cloudflare Tunnel token 单独使用
+ * Electron safeStorage 加密，绝不能写入 settings.json 或日志。
+ */
+const DEFAULT_MOBILE_SETTINGS = {
+  enabled: false,
+  mode: "auto",
+  lanPort: 3081,
+  publicWssUrl: "",
+};
 const DEFAULT_SETTINGS = {
   balancePlugin: true,    // 余额插件开关（默认打开）
   receiptEnabled: true,   // 小票功能开关（默认打开）
   updateChannel: "latest",// 版本列表频道：latest / next / alpha（默认 Latest）
   notifiedVersion: null,  // 已提示过的新版本号（每次新版本只提示一次）
   llama: { ...DEFAULT_LLAMA_SETTINGS, activePresetId: "default", presets: [defaultLlamaPreset()] }, // llama.cpp 启动器
+  mobile: { ...DEFAULT_MOBILE_SETTINGS },
 };
+/** 清洗移动设备的非敏感配置，并兼容旧的 mobile.port。 */
+function sanitizeMobileSettings(raw) {
+  const out = { ...DEFAULT_MOBILE_SETTINGS };
+  if (!raw || typeof raw !== "object") return out;
+  out.enabled = raw.enabled === true;
+  out.mode = "auto";
+  const port = Number(raw.lanPort ?? raw.port);
+  out.lanPort = Number.isFinite(port) && port >= 1 && port <= 65535
+    ? Math.floor(port)
+    : DEFAULT_MOBILE_SETTINGS.lanPort;
+  out.publicWssUrl = normalizeMobileWssUrl(raw.publicWssUrl);
+  return out;
+}
+
+// ---------- 移动设备 Gateway 与 Cloudflare Tunnel ----------
+const MOBILE_TUNNEL_SECRET_FILE = () => path.join(app.getPath("userData"), "mobile-tunnel.secret");
+let mobileTunnelChild = null;
+let mobileTunnelState = { running: false, configured: false, error: null, startedAt: null };
+let mobileGatewayInstallState = { installing: false, error: null, stage: null, percent: 0 };
+
+function mobileGatewayProfilePackageJson() {
+  const home = process.env.DSH_HOME && process.env.DSH_HOME.trim() !== ""
+    ? path.resolve(process.env.DSH_HOME)
+    : path.join(os.homedir(), ".dsh");
+  return path.join(home, "profiles", "web", "node_modules", MOBILE_GATEWAY_PACKAGE, "package.json");
+}
+
+function mobileGatewayPluginStatus() {
+  const packageJson = mobileGatewayProfilePackageJson();
+  const version = readPackageVersion(packageJson);
+  return {
+    installed: Boolean(version),
+    version,
+    installing: mobileGatewayInstallState.installing,
+    error: mobileGatewayInstallState.error,
+    stage: mobileGatewayInstallState.stage,
+    percent: mobileGatewayInstallState.percent,
+  };
+}
+
+function normalizeMobileWssUrl(value) {
+  if (typeof value !== "string" || !value.trim()) return "";
+  try {
+    const url = new URL(value.trim());
+    if (url.protocol !== "wss:" || !url.hostname || url.username || url.password || url.search || url.hash) return "";
+    if (!url.pathname || url.pathname === "/") url.pathname = "/ws/mobile";
+    if (url.pathname !== "/ws/mobile") return "";
+    return url.href;
+  } catch { return ""; }
+}
+
+function readMobileTunnelToken() {
+  try {
+    if (!safeStorage.isEncryptionAvailable() || !fs.existsSync(MOBILE_TUNNEL_SECRET_FILE())) return null;
+    const encoded = fs.readFileSync(MOBILE_TUNNEL_SECRET_FILE(), "utf8").trim();
+    return encoded ? safeStorage.decryptString(Buffer.from(encoded, "base64")) : null;
+  } catch { return null; }
+}
+
+function writeMobileTunnelToken(token) {
+  if (!safeStorage.isEncryptionAvailable()) throw new Error("系统加密存储不可用，无法保存 Cloudflare Tunnel Token");
+  const value = String(token || "").trim();
+  if (!value) throw new Error("Cloudflare Tunnel Token 不能为空");
+  const encrypted = safeStorage.encryptString(value).toString("base64");
+  fs.mkdirSync(path.dirname(MOBILE_TUNNEL_SECRET_FILE()), { recursive: true });
+  fs.writeFileSync(MOBILE_TUNNEL_SECRET_FILE(), `${encrypted}\n`, { mode: 0o600 });
+}
+
+function mobileGatewayPublicStatus() {
+  const cfg = appSettings.mobile || DEFAULT_MOBILE_SETTINGS;
+  return {
+    enabled: cfg.enabled,
+    mode: "auto",
+    lanPort: cfg.lanPort,
+    publicWssUrl: cfg.publicWssUrl || null,
+    plugin: mobileGatewayPluginStatus(),
+    tunnel: {
+      ...mobileTunnelState,
+      configured: Boolean(cfg.publicWssUrl && readMobileTunnelToken()),
+    },
+  };
+}
+
+function broadcastMobileStatus() {
+  const status = mobileGatewayPublicStatus();
+  for (const w of BrowserWindow.getAllWindows()) {
+    try {
+      if (!w.isDestroyed()) w.webContents.send("dsh:mobile-status-changed", status);
+    } catch { /* ignore */ }
+  }
+}
+
+function stopMobileTunnel() {
+  const child = mobileTunnelChild;
+  mobileTunnelChild = null;
+  if (child && !child.killed) {
+    try { child.kill(); } catch { /* ignore */ }
+  }
+  mobileTunnelState = { ...mobileTunnelState, running: false, startedAt: null };
+}
+
+/** 按当前设置启停固定域名的 Named Tunnel；Gateway 本身由 DSH 插件托管。 */
+async function applyMobileBridgeFromSettings() {
+  const cfg = appSettings.mobile || DEFAULT_MOBILE_SETTINGS;
+  if (!cfg.enabled || !cfg.publicWssUrl) {
+    stopMobileTunnel();
+    broadcastMobileStatus();
+    return mobileGatewayPublicStatus();
+  }
+  const token = readMobileTunnelToken();
+  if (!token) {
+    mobileTunnelState = { running: false, configured: false, error: "请先配置 Cloudflare Tunnel Token", startedAt: null };
+    broadcastMobileStatus();
+    return mobileGatewayPublicStatus();
+  }
+  if (mobileTunnelChild && !mobileTunnelChild.killed) return mobileGatewayPublicStatus();
+  // cloudflared 必须由用户安装或由发行包提供；命令行参数不写入日志。
+  const command = process.env.DSH_CLOUDFLARED_PATH || "cloudflared.exe";
+  try {
+    const child = spawn(command, ["tunnel", "run", "--token", token], {
+      windowsHide: true,
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    mobileTunnelChild = child;
+    // Named Tunnel 的子进程已启动不等于边缘连接已建立；收到连接就绪日志前不能签发公网二维码。
+    mobileTunnelState = { running: false, configured: true, error: null, startedAt: Date.now() };
+    child.once("error", (error) => {
+      if (mobileTunnelChild !== child) return;
+      mobileTunnelChild = null;
+      mobileTunnelState = { ...mobileTunnelState, running: false, error: `Cloudflare Tunnel 启动失败：${error.message}` };
+      broadcastMobileStatus();
+    });
+    child.once("exit", (code) => {
+      if (mobileTunnelChild !== child) return;
+      mobileTunnelChild = null;
+      mobileTunnelState = { ...mobileTunnelState, running: false, error: code === 0 ? null : `Cloudflare Tunnel 已退出（${code ?? "未知"}）` };
+      broadcastMobileStatus();
+    });
+    child.stderr.on("data", (chunk) => {
+      // 不记录 cloudflared 原文，它可能含连接上下文；只消费稳定的就绪标识。
+      if (mobileTunnelChild === child && /registered tunnel connection|connection .* registered|initial protocol/i.test(String(chunk))) {
+        mobileTunnelState = { ...mobileTunnelState, running: true, error: null };
+        broadcastMobileStatus();
+      }
+    });
+  } catch (error) {
+    mobileTunnelState = { running: false, configured: true, error: `Cloudflare Tunnel 启动失败：${error.message}`, startedAt: null };
+  }
+  broadcastMobileStatus();
+  return mobileGatewayPublicStatus();
+}
+
+/** 保留既有启动钩子名称；Gateway 已由 DSH web profile 插件装载，无需再做代理挂接。 */
+async function attachMobileBridgeDsh(url) {
+  if (!url) return mobileGatewayPublicStatus();
+  return applyMobileBridgeFromSettings();
+}
+
+async function stopMobileBridge() {
+  stopMobileTunnel();
+  broadcastMobileStatus();
+}
+
+async function installMobileGatewayLatest(win) {
+  if (mobileGatewayInstallState.installing) return { ok: false, error: "移动网关正在安装" };
+  mobileGatewayInstallState = { installing: true, error: null, stage: "正在准备安装…", percent: 4 };
+  broadcastMobileStatus();
+  const progressTimer = setInterval(() => {
+    if (!mobileGatewayInstallState.installing) return;
+    const percent = Math.min(78, Math.max(12, Number(mobileGatewayInstallState.percent || 0) + 2));
+    mobileGatewayInstallState = {
+      ...mobileGatewayInstallState,
+      stage: "正在下载并安装移动网关…",
+      percent,
+    };
+    broadcastMobileStatus();
+  }, 900);
+  try {
+    const launch = buildDshWebLaunch();
+    const pluginResult = await runLoggedCommand(launch.command, [
+      "--expose-internals",
+      probeManagedDshRuntime().binPath,
+      "plugin", "--profile", "web", "add", MOBILE_GATEWAY_LATEST_SPEC,
+    ], {
+      cwd: app.getPath("userData"),
+      env: launch.env,
+      onLine: (line) => {
+        log(`mobile gateway install: ${line}`);
+        mobileGatewayInstallState = {
+          ...mobileGatewayInstallState,
+          stage: "正在下载并安装移动网关…",
+          percent: Math.min(82, Math.max(18, Number(mobileGatewayInstallState.percent || 0) + 4)),
+        };
+        broadcastMobileStatus();
+      },
+    });
+    if (pluginResult.code !== 0) throw new Error(pluginResult.tail || `插件安装退出码 ${pluginResult.code}`);
+    ensureProfilePluginsResolvable();
+    mobileGatewayInstallState = { ...mobileGatewayInstallState, stage: "正在重启服务并加载插件…", percent: 88 };
+    broadcastMobileStatus();
+    killServerTree();
+    const port = await bootServer(win);
+    if (port === null) throw new Error("DSH 服务重启失败");
+    mobileGatewayInstallState = { ...mobileGatewayInstallState, stage: "安装完成，正在刷新界面…", percent: 100 };
+    broadcastMobileStatus();
+    setTimeout(() => {
+      if (win.isDestroyed()) return;
+      const target = readyServerUrl(port);
+      attachMobileBridgeDsh(target).catch(() => {});
+      win.loadURL(target).catch((error) => log(`mobile gateway post-install reload failed: ${error.message}`));
+    }, 120);
+    return { ok: true, plugin: mobileGatewayPluginStatus() };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    mobileGatewayInstallState = { installing: false, error: message, stage: "安装失败，请检查网络后重试", percent: 0 };
+    broadcastMobileStatus();
+    throw new Error(`移动网关安装失败：${message}`);
+  } finally {
+    clearInterval(progressTimer);
+    if (mobileGatewayInstallState.installing) {
+      mobileGatewayInstallState = { installing: false, error: null, stage: null, percent: 0 };
+      broadcastMobileStatus();
+    }
+  }
+}
 /** 清洗/规范化 llama 配置（来自 settings.json 或渲染层补丁）。 */
 function sanitizeLlamaSettings(raw) {
   const out = { ...DEFAULT_LLAMA_SETTINGS };
@@ -479,6 +719,7 @@ function loadAppSettings() {
         ...(isUpdateChannel(parsed.updateChannel) ? { updateChannel: parsed.updateChannel } : {}),
         ...(typeof parsed.notifiedVersion === "string" && parsed.notifiedVersion.trim() !== "" ? { notifiedVersion: parsed.notifiedVersion } : {}),
         ...(parsed.llama !== undefined ? { llama: sanitizeLlamaSettings(parsed.llama) } : {}),
+        ...(parsed.mobile !== undefined ? { mobile: sanitizeMobileSettings(parsed.mobile) } : {}),
       };
     }
   } catch { /* 首次运行 */ }
@@ -494,6 +735,67 @@ function broadcastSettings() {
     try {
       if (!w.isDestroyed()) w.webContents.send("dsh:settings-changed", appSettings);
     } catch { /* ignore */ }
+  }
+}
+
+/**
+ * 把 ~/.dsh/profiles/web/node_modules 里用户自装插件链到 dsh-runtime，
+ * 否则 ESM 从 cordis-plugin-loader 解析不到（导致 Failed to load plugins）。
+ */
+function ensureProfilePluginsResolvable() {
+  try {
+    const home = process.env.DSH_HOME && process.env.DSH_HOME.trim() !== ""
+      ? path.resolve(process.env.DSH_HOME)
+      : path.join(os.homedir(), ".dsh");
+    const runtimeNm = path.join(managedDshRuntimeDir() || path.join(app.getPath("userData"), "dsh-runtime"), "node_modules");
+    if (!fs.existsSync(runtimeNm)) return;
+    const roots = [
+      path.join(home, "profiles", "web", "node_modules"),
+      path.join(home, "profiles", "node_modules"),
+    ];
+    for (const profileNm of roots) {
+      if (!fs.existsSync(profileNm)) continue;
+      const names = fs.readdirSync(profileNm).filter((n) => !n.startsWith("."));
+      for (const name of names) {
+        if (name === ".pnpm" || name === ".modules.yaml") continue;
+        if (name.startsWith("@")) {
+          const scopedSrc = path.join(profileNm, name);
+          if (!fs.statSync(scopedSrc).isDirectory()) continue;
+          const scopedDst = path.join(runtimeNm, name);
+          if (!fs.existsSync(scopedDst)) {
+            try { fs.mkdirSync(scopedDst, { recursive: true }); } catch { /* ignore */ }
+          }
+          for (const sub of fs.readdirSync(scopedSrc)) {
+            linkIfMissing(path.join(scopedSrc, sub), path.join(scopedDst, sub), log);
+          }
+          continue;
+        }
+        const src = path.join(profileNm, name);
+        try {
+          if (!fs.statSync(src).isDirectory()) continue;
+        } catch { continue; }
+        linkIfMissing(src, path.join(runtimeNm, name), log);
+      }
+    }
+  } catch (err) {
+    log(`profile plugin link skipped: ${err && err.message}`);
+  }
+}
+
+function linkIfMissing(src, dest, logFn) {
+  if (!fs.existsSync(src)) return;
+  if (fs.existsSync(dest)) return;
+  try {
+    fs.symlinkSync(src, dest, "junction");
+    logFn(`linked profile plugin: ${path.basename(dest)}`);
+  } catch (err) {
+    // 回退：复制目录
+    try {
+      fs.cpSync(src, dest, { recursive: true, dereference: true });
+      logFn(`copied profile plugin: ${path.basename(dest)}`);
+    } catch (err2) {
+      logFn(`link/copy plugin failed ${path.basename(dest)}: ${err2 && err2.message}`);
+    }
   }
 }
 
@@ -1634,6 +1936,24 @@ function syncBundledDamagePulse() {
   log(`bundled damage-pulse synced to ${target}`);
 }
 
+/**
+ * The upstream reasoning-effort bundle predates the client-module split.
+ * Ship its migrated copy beside the desktop app and expose it through the
+ * profile fallback, leaving the user's original backup untouched.
+ */
+function syncBundledReasoningEffort() {
+  const dshHome = process.env.DSH_HOME && process.env.DSH_HOME.trim() !== ""
+    ? path.resolve(process.env.DSH_HOME)
+    : path.join(os.homedir(), ".dsh");
+  const target = path.join(dshHome, "profiles", "node_modules", "dsh-reasoning-effort");
+  if (!fs.existsSync(REASONING_EFFORT_MODULE)) {
+    throw new Error(`内置 reasoning-effort bundle 缺失：${REASONING_EFFORT_MODULE}`);
+  }
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.cpSync(REASONING_EFFORT_MODULE, target, { recursive: true, force: true });
+  log(`bundled reasoning-effort synced to ${target}`);
+}
+
 function buildDshWebLaunch() {
   const useNativeNode = (runtimeMode === "native" || runtimeMode === "global")
     && nativeRuntime
@@ -1663,9 +1983,12 @@ function buildDshWebLaunch() {
   return {
     command,
     args: [
+      // cordis-plugin-hmr 需要该 Node 标志，否则客户端插件树加载失败
+      "--expose-internals",
       dshProbe.binPath,
       "web",
       "--patch", DAMAGE_PULSE_PATCH,
+      "--patch", REASONING_EFFORT_PATCH,
       "--port", "0",
       // 桌面版自带界面，不需要 dsh web 再拉起系统默认浏览器
       "--no-open",
@@ -1691,6 +2014,7 @@ async function startServer(win, options = {}) {
     percent: verbose ? 0 : 93,
   });
   syncBundledDamagePulse();
+  syncBundledReasoningEffort();
   const logPath = SERVER_LOG();
   let launch;
   try {
@@ -2022,6 +2346,26 @@ function readyServerUrl(port) {
   return `http://127.0.0.1:${port}`;
 }
 
+/**
+ * BrowserAuth names a cookie per temporary loopback authority. Electron cookies
+ * are scoped by host rather than port, so old DSH cookies accumulate and can
+ * eventually make the next launch request exceed Node's header-size limit.
+ */
+async function clearStaleLoopbackDshAuthCookies(session) {
+  if (!session?.cookies) return;
+  try {
+    const cookies = await session.cookies.get({ domain: "127.0.0.1" });
+    await Promise.all(cookies
+      .filter((cookie) => cookie.name.startsWith("dsh-auth-"))
+      .map((cookie) => session.cookies.remove("http://127.0.0.1", cookie.name)));
+    if (cookies.some((cookie) => cookie.name.startsWith("dsh-auth-"))) {
+      log("cleared stale loopback DSH authentication cookies");
+    }
+  } catch (error) {
+    log(`loopback auth-cookie cleanup skipped: ${error && error.message}`);
+  }
+}
+
 /** 查询单个更新频道的 npm dist-tag 版本。 */
 async function latestDshVersionForChannel(channel = "latest") {
   const tag = isUpdateChannel(channel) ? channel : "latest";
@@ -2315,6 +2659,7 @@ async function installVersionWithSplash(win, version, channel = appSettings.upda
         if (!win.isDestroyed()) {
           const target = pendingBootUrl;
           pendingBootUrl = null;
+          attachMobileBridgeDsh(target).catch(() => {});
           win.loadURL(target);
         }
         return;
@@ -2474,6 +2819,7 @@ async function performUpdate(win, { silent = false } = {}) {
     if (!win.isDestroyed()) {
       const target = pendingBootUrl || win.webContents.getURL();
       pendingBootUrl = null;
+      attachMobileBridgeDsh(target).catch(() => {});
       win.loadURL(target);
     }
     await ready;
@@ -2536,6 +2882,10 @@ function createWindow(url, savedBoot = null) {
   win.webContents.once("did-finish-load", () => {
     const cached = bootPayloadCache.get(win);
     if (cached) sendBoot(win, cached);
+  });
+  win.webContents.on("console-message", (_event, level, message, line, sourceId) => {
+    if (level < 2) return;
+    log(`[renderer:${level}] ${String(message)} (${sourceId || "unknown"}:${line || 0})`);
   });
   win.on("maximize", () => win.webContents.send("dsh:win-maximized", true));
   win.on("unmaximize", () => win.webContents.send("dsh:win-maximized", false));
@@ -2642,9 +2992,15 @@ function registerIpc() {
     if (patch.updateChannel === "latest" || patch.updateChannel === "next" || patch.updateChannel === "alpha") next.updateChannel = patch.updateChannel;
     if (typeof patch.notifiedVersion === "string") next.notifiedVersion = patch.notifiedVersion;
     if (patch.llama && typeof patch.llama === "object") next.llama = sanitizeLlamaSettings(patch.llama);
+    if (patch.mobile && typeof patch.mobile === "object") {
+      next.mobile = sanitizeMobileSettings({ ...appSettings.mobile, ...patch.mobile });
+    }
     appSettings = next;
     saveAppSettings();
     broadcastSettings();
+    if (patch.mobile && typeof patch.mobile === "object") {
+      applyMobileBridgeFromSettings().catch((err) => log(`mobile tunnel settings failed: ${err && err.message}`));
+    }
   });
   // llama.cpp 启动器：读取配置/模型列表/状态
   ipcMain.handle("dsh:llama-get", () => {
@@ -2703,6 +3059,42 @@ function registerIpc() {
   ipcMain.on("dsh:llama-stop", () => {
     stopLlamaServer();
   });
+  // 移动设备 Gateway。/mgw 管理请求由同源 DSH renderer 发起，主进程只持有 Tunnel 密钥。
+  ipcMain.handle("dsh:mobile-get", async () => ({
+    settings: appSettings.mobile || DEFAULT_MOBILE_SETTINGS,
+    status: mobileGatewayPublicStatus(),
+  }));
+  ipcMain.handle("dsh:mobile-save", async (event, patch) => {
+    if (!patch || typeof patch !== "object") return mobileGatewayPublicStatus();
+    const next = { ...appSettings.mobile, ...patch };
+    appSettings.mobile = sanitizeMobileSettings(next);
+    saveAppSettings();
+    broadcastSettings();
+    await applyMobileBridgeFromSettings();
+    return mobileGatewayPublicStatus();
+  });
+  ipcMain.handle("dsh:mobile-tunnel-configure", async (event, value) => {
+    const endpoint = normalizeMobileWssUrl(value && value.publicWssUrl);
+    if (!endpoint) throw new Error("公网地址必须是 wss://域名/ws/mobile，不能包含账号、查询参数或片段");
+    writeMobileTunnelToken(value && value.token);
+    appSettings.mobile = sanitizeMobileSettings({ ...appSettings.mobile, publicWssUrl: endpoint });
+    saveAppSettings();
+    await applyMobileBridgeFromSettings();
+    return mobileGatewayPublicStatus();
+  });
+  ipcMain.handle("dsh:mobile-tunnel-clear", async () => {
+    stopMobileTunnel();
+    try { fs.rmSync(MOBILE_TUNNEL_SECRET_FILE(), { force: true }); } catch { /* ignore */ }
+    appSettings.mobile = sanitizeMobileSettings({ ...appSettings.mobile, publicWssUrl: "" });
+    saveAppSettings();
+    broadcastMobileStatus();
+    return mobileGatewayPublicStatus();
+  });
+  ipcMain.handle("dsh:mobile-install-latest", async (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (!win) throw new Error("未找到当前窗口");
+    return installMobileGatewayLatest(win);
+  });
   ipcMain.handle("dsh:list-versions", () => listDshVersions());
   ipcMain.on("dsh:install-version", (event, request) => {
     const win = BrowserWindow.fromWebContents(event.sender);
@@ -2728,6 +3120,7 @@ function registerIpc() {
     if (pendingBootUrl) {
       const target = pendingBootUrl;
       pendingBootUrl = null;
+      attachMobileBridgeDsh(target).catch(() => {});
       win.loadURL(target);
       return { ok: true };
     }
@@ -2738,6 +3131,7 @@ function registerIpc() {
     if (!win || !pendingBootUrl) return { ok: false };
     const target = pendingBootUrl;
     pendingBootUrl = null;
+    attachMobileBridgeDsh(target).catch(() => {});
     const ready = waitForRendererReady(win);
     win.loadURL(target);
     await ready;
@@ -2916,6 +3310,10 @@ function registerIpc() {
         if (pendingBootUrl) {
           const target = pendingBootUrl;
           pendingBootUrl = null;
+          attachMobileBridgeDsh(target).catch(() => {});
+          if (appSettings.mobile && appSettings.mobile.enabled) {
+            applyMobileBridgeFromSettings().catch(() => {});
+          }
           win.loadURL(target);
           return;
         }
@@ -2961,6 +3359,11 @@ app.whenReady().then(async () => {
   log(`dev=${isDev}`);
   loadSplashTheme();
   loadAppSettings();
+  ensureProfilePluginsResolvable();
+  // 手机连接：若已启用则尽早监听局域网（配对可在 dsh 就绪前完成）
+  if (appSettings.mobile && appSettings.mobile.enabled) {
+    applyMobileBridgeFromSettings().catch((err) => log(`mobile bridge early start failed: ${err && err.message}`));
+  }
 
   const savedBoot = loadBootChoice();
   if (savedBoot && savedBoot.dshVersion) dshLaunchVersion = savedBoot.dshVersion;
@@ -3023,12 +3426,14 @@ app.whenReady().then(async () => {
  *  options.skipLlama：首次安装等场景跳过 llama 跟随启动阶段（避免干扰安装视图）。 */
 async function bootServer(win, options = {}) {
   log(`dsh version: ${bundledDshVersion()}`);
+  ensureProfilePluginsResolvable();
   // llama 跟随软件启动：先于 harness 服务拉起 llama-server，真实进度写入启动页进度条
   if (!options.skipLlama) await maybeStartLlamaBeforeHarness(win);
   const port = await startServer(win, options);
   if (port === null) return;
   if (options.readyBeforeLoad) {
     pendingBootUrl = readyServerUrl(port);
+    // 等用户点「开始使用」加载 UI 后再挂接
     sendBoot(win, {
       page: "ready",
       stage: readyStageText(runtimeMode),
@@ -3041,9 +3446,16 @@ async function bootServer(win, options = {}) {
   }
   const url = readyServerUrl(port);
   log(`GUI ready at ${redactServerAuth(url)}`);
-  // 启动画面 → 主界面：导航时保持主题实色底，避免页面首帧白闪；
-  // 页面渲染出主题底色后（dsh:theme 上报）再由主进程恢复毛玻璃透明底。
+  await clearStaleLoopbackDshAuthCookies(win.webContents.session);
+  // 先加载桌面 UI，再挂接手机 Bridge，避免抢先消费一次性 launch token
   win.loadURL(url);
+  // 手机功能关闭时不连接 Bridge，避免第二个本地客户端触碰一次性启动令牌。
+  if (appSettings.mobile && appSettings.mobile.enabled) {
+    setTimeout(() => {
+      attachMobileBridgeDsh(url).catch((err) => log(`mobile bridge boot failed: ${err && err.message}`));
+      applyMobileBridgeFromSettings().catch((err) => log(`mobile bridge start failed: ${err && err.message}`));
+    }, 800);
+  }
 
   // 启动后静默检查一次更新（同时监控 Latest / Next / Alpha，发现新版本只通过设置弹窗提示一次）：
   // 等页面 preload 上报就绪后再触发，避免页面还在加载、状态事件丢失。
@@ -3063,6 +3475,7 @@ app.on("window-all-closed", () => {
   quitting = true;
   killServerTree();
   stopLlamaServer();
+  stopMobileBridge();
   app.quit();
 });
 
@@ -3070,6 +3483,7 @@ app.on("before-quit", () => {
   quitting = true;
   killServerTree();
   stopLlamaServer();
+  stopMobileBridge();
 });
 
 process.on("uncaughtException", (err) => {

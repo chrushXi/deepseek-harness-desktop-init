@@ -144,6 +144,19 @@ function normalizePriceTable(candidate) {
 			peak: mergeRate(PRICE_TABLE.models[model].peak, candidateModel?.peak)
 		};
 	}
+	// 保留价格表里额外的官方 catalog 模型（动态目录可能比内置两个 key 更多）
+	if (source.models && typeof source.models === "object") {
+		for (const model of Object.keys(source.models)) {
+			if (base.models[model] !== void 0) continue;
+			if (typeof model !== "string" || model.trim() === "") continue;
+			const candidateModel = source.models[model];
+			if (!candidateModel || typeof candidateModel !== "object") continue;
+			base.models[model] = {
+				offPeak: mergeRate(PRICE_TABLE.models["deepseek-v4-flash"].offPeak, candidateModel.offPeak),
+				peak: mergeRate(PRICE_TABLE.models["deepseek-v4-flash"].peak, candidateModel.peak)
+			};
+		}
+	}
 	return base;
 }
 function replacePriceTable(target, source) {
@@ -668,6 +681,30 @@ var UsageStorage = class {
 const name = "dsh-token-monitor";
 const inject = ["sessions", "credentials"];
 const SETTINGS_NS = settingsNamespace("dsh-token-monitor");
+/** 与 @deepseek-ai/dsh-llm-deepseek DEFAULT_MODELS 对齐的官方 catalog（llm 服务不可用时的回落）。 */
+const OFFICIAL_FALLBACK_MODELS = [
+	{ provider: "deepseek-official", id: "deepseek-v4-flash", name: "DeepSeek-V4-Flash" },
+	{ provider: "deepseek-official", id: "deepseek-v4-pro", name: "DeepSeek-V4-Pro" }
+];
+/** 从 llm 服务读官方模型；失败回落内置目录。id 即计费 key，name 仅展示。 */
+async function resolveOfficialModels(llm) {
+	try {
+		if (llm && typeof llm.listModels === "function") {
+			const models = await llm.listModels("deepseek-official");
+			if (Array.isArray(models) && models.length > 0) {
+				const mapped = models.map((model) => ({
+					provider: "deepseek-official",
+					id: String(model?.id ?? "").trim(),
+					name: String(model?.name ?? model?.id ?? "").trim() || String(model?.id ?? "").trim()
+				})).filter((model) => model.id !== "");
+				if (mapped.length > 0) return mapped;
+			}
+		}
+	} catch (error) {
+		console.warn(`[dsh-damage-pulse] 读取 llm 官方模型目录失败，使用内置回落: ${String(error).slice(0, 200)}`);
+	}
+	return OFFICIAL_FALLBACK_MODELS;
+}
 /** 用户可编辑设置：价格表可覆盖（宽松 any，默认 PRICE_TABLE）。 */
 const settingsSchema = z.object({ priceTable: z.any().default(PRICE_TABLE) });
 /**
@@ -844,9 +881,26 @@ function apply(ctx) {
 	], async (migrateCtx) => {
 		await migrateMissingTokenCost(migrateCtx);
 	});
+	let llmRef = null;
+	ctx.inject(["llm"], (llmCtx) => {
+		llmRef = llmCtx.llm;
+	});
 	ctx.inject(["webServer"], (webCtx) => {
 		registerBalanceRoute(webCtx, balance, storage);
 		console.log("[dsh-damage-pulse] balance route registered");
+		webCtx.webServer.register({
+			kind: "exact",
+			path: "/api/token-monitor/models",
+			handler: async (req, res) => {
+				try {
+					const models = await resolveOfficialModels(llmRef);
+					sendJson(res, 200, { models });
+				} catch (error) {
+					sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
+				}
+			}
+		});
+		console.log("[dsh-damage-pulse] models route registered");
 		webCtx.webServer.register({
 			kind: "exact",
 			path: "/api/token-monitor/usage-scope",

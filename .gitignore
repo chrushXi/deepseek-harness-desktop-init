@@ -19,6 +19,9 @@ dist/
 .tmp-harness.html
 .tmp-harness-assets/
 .scratch-session-repair/
+.workbuddy/
+scripts/scan-session-api.cjs
+internal/damage-pulse/verify-*.mjs
 
 # OS
 Thumbs.db
